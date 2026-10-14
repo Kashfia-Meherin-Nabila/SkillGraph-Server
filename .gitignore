@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Environment Variables (Protects your MONGODB_URI!)
+.env
+.env.*
+
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+.vscode/
