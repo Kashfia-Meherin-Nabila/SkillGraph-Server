@@ -27,6 +27,8 @@ let modulesCollection;
 let progressCollection;
 let skillsCollection;
 let userSkillProgressCollection;
+let assessmentsCollection;
+let assessmentHistoryCollection;
 
 export async function connectToMongoDB() {
   try {
@@ -37,6 +39,8 @@ export async function connectToMongoDB() {
     progressCollection = db.collection("user_progress");
     skillsCollection = db.collection("skills");
     userSkillProgressCollection = db.collection("user_skill_progress");
+    assessmentsCollection = db.collection("assessments");
+    assessmentHistoryCollection = db.collection("assessment_history");
     console.log("Successfully connected to MongoDB!");
     return client;
   } catch (err) {
@@ -411,6 +415,313 @@ app.put("/api/skill-progress", async (req, res) => {
     });
   }
 });
+
+/* ========================================================
+   ROADMAP API — SKILLS + MODULES + USER PROGRESS
+======================================================== */
+
+// 12.GET /api/roadmap?courseSlug=frontend&email=user@example.com
+app.get("/api/roadmap", async (req, res) => {
+  try {
+    const courseSlug = String(req.query.courseSlug || "")
+      .trim()
+      .toLowerCase();
+
+    const email = String(req.query.email || "")
+      .trim()
+      .toLowerCase();
+
+    if (!courseSlug) {
+      return res.status(400).json({
+        success: false,
+        message: "courseSlug query parameter is required.",
+      });
+    }
+
+    if (!skillsCollection || !modulesCollection || !progressCollection) {
+      return res.status(503).json({
+        success: false,
+        message: "Database collections are not initialized.",
+      });
+    }
+
+    // Fetch the existing skills for the selected career.
+    const skills = await skillsCollection
+      .find({ courseSlug })
+      .sort({ priority: 1, name: 1 })
+      .toArray();
+
+    // Fetch the existing modules for this career.
+    const modules = await modulesCollection
+      .find({ courseSlug })
+      .sort({ moduleId: 1 })
+      .toArray();
+
+    // Match each skill's moduleIds with modules.moduleId.
+    const roadmap = skills.map((skill) => {
+      const moduleIds = Array.isArray(skill.moduleIds)
+        ? skill.moduleIds.map(Number)
+        : [];
+
+      const matchedModules = modules
+        .filter((module) => moduleIds.includes(Number(module.moduleId)))
+        .map((module) => ({
+          _id: module._id,
+          moduleId: module.moduleId,
+          title: module.title,
+          tasks: Array.isArray(module.tasks) ? module.tasks : [],
+        }));
+
+      return {
+        ...skill,
+        modules: matchedModules,
+      };
+    });
+
+    // Load the user's existing completed tasks, if an email is supplied.
+    let completedTasks = [];
+
+    if (email) {
+      const progress = await progressCollection.findOne({
+        email,
+        courseSlug,
+      });
+
+      completedTasks = progress?.completedTasks || [];
+    }
+
+    const allTasks = roadmap.flatMap((skill) =>
+      skill.modules.flatMap((module) =>
+        module.tasks.map((task) => ({
+          ...task,
+          skillId: skill._id,
+          skillName: skill.name,
+          moduleId: module.moduleId,
+          moduleTitle: module.title,
+        })),
+      ),
+    );
+
+    const completedTaskSet = new Set(completedTasks);
+
+    const completedCount = allTasks.filter((task) =>
+      completedTaskSet.has(task.id),
+    ).length;
+
+    return res.status(200).json({
+      success: true,
+      courseSlug,
+      summary: {
+        totalSkills: roadmap.length,
+        totalModules: new Set(
+          roadmap.flatMap((skill) =>
+            skill.modules.map(
+              (module) => `${courseSlug}:${module.moduleId}`,
+            ),
+          ),
+        ).size,
+        totalTasks: allTasks.length,
+        completedTasks: completedCount,
+        progressPercentage: allTasks.length
+          ? Math.round((completedCount / allTasks.length) * 100)
+          : 0,
+      },
+      completedTasks,
+      data: roadmap,
+    });
+  } catch (error) {
+    console.error("Failed to generate roadmap:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to generate roadmap.",
+    });
+  }
+});
+
+/* ========================================================
+   ASSESSMENTS APIS (QUIZZES & CODING CHALLENGES)
+======================================================== */
+
+// 13. GET ALL ASSESSMENTS BY COURSE SLUG
+app.get("/api/assessments", async (req, res) => {
+  try {
+    const courseSlug = String(req.query.courseSlug || "frontend")
+      .trim()
+      .toLowerCase();
+
+    const assessments = await assessmentsCollection
+      .find({ courseSlug })
+      .toArray();
+
+    res.json({
+      success: true,
+      data: assessments,
+    });
+  } catch (err) {
+    console.error("Failed to fetch assessments:", err);
+    res.status(500).json({ success: false, message: "Failed to fetch assessments" });
+  }
+});
+
+// 14. GET USER ASSESSMENT HISTORY & ATTEMPTS
+app.get("/api/assessments/history/:email", async (req, res) => {
+  try {
+    const email = String(req.params.email || "").trim().toLowerCase();
+    const courseSlug = String(req.query.courseSlug || "").trim().toLowerCase();
+
+    const history = await assessmentHistoryCollection
+      .find({ email, courseSlug })
+      .toArray();
+
+    res.json({
+      success: true,
+      data: history,
+    });
+  } catch (err) {
+    console.error("Failed to fetch assessment history:", err);
+    res.status(500).json({ success: false, message: "Failed to fetch history" });
+  }
+});
+
+// 15. GET SINGLE ASSESSMENT WITH QUESTIONS (WITHOUT REVEALING CORRECT ANSWERS)
+app.get("/api/assessments/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid assessment ID" });
+    }
+
+    const assessment = await assessmentsCollection.findOne({ _id: new ObjectId(id) });
+    if (!assessment) {
+      return res.status(404).json({ success: false, message: "Assessment not found" });
+    }
+
+    // Strip out correct answers before sending questions to the client
+    const sanitizedQuestions = (assessment.questions || []).map((q, index) => ({
+      _id: q._id || index,
+      type: q.type || "mcq",
+      title: q.title || "",
+      prompt: q.prompt || "",
+      code: q.code || "",
+      difficulty: q.difficulty || assessment.difficulty,
+      options: q.options || [],
+      examples: q.examples || [],
+      constraints: q.constraints || [],
+      starterCode: q.starterCode || "",
+    }));
+
+    res.json({
+      success: true,
+      data: {
+        ...assessment,
+        questions: sanitizedQuestions,
+      },
+    });
+  } catch (err) {
+    console.error("Failed to fetch assessment details:", err);
+    res.status(500).json({ success: false, message: "Failed to load assessment" });
+  }
+});
+
+// 16. SUBMIT ASSESSMENT AND GRADE ANSWERS
+app.post("/api/assessments/:id/submit", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { email, courseSlug, answers, durationSeconds } = req.body;
+
+    if (!email || !ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid submission data" });
+    }
+
+    const assessment = await assessmentsCollection.findOne({ _id: new ObjectId(id) });
+    if (!assessment) {
+      return res.status(404).json({ success: false, message: "Assessment not found" });
+    }
+
+    const questions = assessment.questions || [];
+    let correctCount = 0;
+
+    questions.forEach((q, idx) => {
+      const userAns = answers.find(
+        (a) => String(a.questionId) === String(q._id || idx)
+      )?.answer;
+
+      if (q.type === "coding") {
+        // Basic check: awarded if user provided non-empty code solution
+        if (typeof userAns === "string" && userAns.trim().length > 10) {
+          correctCount++;
+        }
+      } else {
+        // MCQ check against correctOption index
+        if (Number(userAns) === Number(q.correctOption)) {
+          correctCount++;
+        }
+      }
+    });
+
+    const totalQuestions = questions.length || 1;
+    const percentage = Math.round((correctCount / totalQuestions) * 100);
+    const passMark = Number(assessment.passMark) || 70;
+    const passed = percentage >= passMark;
+
+    const resultRecord = {
+      assessmentId: String(assessment._id),
+      email: email.toLowerCase(),
+      courseSlug: (courseSlug || assessment.courseSlug || "frontend").toLowerCase(),
+      percentage,
+      correctCount,
+      totalQuestions,
+      passed,
+      durationSeconds: Number(durationSeconds) || 0,
+      completedAt: new Date(),
+    };
+
+    // Update or insert into user assessment history
+    const existingHistory = await assessmentHistoryCollection.findOne({
+      email: resultRecord.email,
+      assessmentId: resultRecord.assessmentId,
+    });
+
+    const attempts = (existingHistory?.attempts || 0) + 1;
+    const bestScore = Math.max(existingHistory?.bestScore || 0, percentage);
+    const everPassed = Boolean(existingHistory?.passed || passed);
+
+    await assessmentHistoryCollection.updateOne(
+      { email: resultRecord.email, assessmentId: resultRecord.assessmentId },
+      {
+        $set: {
+          ...resultRecord,
+          attempts,
+          bestScore,
+          passed: everPassed,
+          badge: everPassed
+            ? {
+                name: assessment.badgeName || `${assessment.title} Badge`,
+                earnedAt: existingHistory?.badge?.earnedAt || new Date(),
+              }
+            : null,
+        },
+      },
+      { upsert: true }
+    );
+
+    res.json({
+      success: true,
+      data: {
+        percentage,
+        correctCount,
+        totalQuestions,
+        passed,
+        badge: everPassed ? { name: assessment.badgeName } : null,
+      },
+    });
+  } catch (err) {
+    console.error("Failed to grade assessment:", err);
+    res.status(500).json({ success: false, message: "Failed to process submission" });
+  }
+});
+
 
 // Call this only when application terminates
 export async function disconnectFromMongoDB() {
