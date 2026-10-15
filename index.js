@@ -29,11 +29,16 @@ let skillsCollection;
 let userSkillProgressCollection;
 let assessmentsCollection;
 let assessmentHistoryCollection;
+let userCollection;
+let codeReviewsCollection;
+let mentorAvailabilityCollection;
+let mentorSessionsCollection;
 
 export async function connectToMongoDB() {
   try {
     await client.connect();
     const db = client.db(process.env.DB_NAME || "skillgraph");
+    userCollection = db.collection("user")
     coursesCollection = db.collection("courses");
     modulesCollection = db.collection("modules");
     progressCollection = db.collection("user_progress");
@@ -41,6 +46,10 @@ export async function connectToMongoDB() {
     userSkillProgressCollection = db.collection("user_skill_progress");
     assessmentsCollection = db.collection("assessments");
     assessmentHistoryCollection = db.collection("assessment_history");
+    codeReviewsCollection = db.collection("code_reviews");
+    mentorAvailabilityCollection = db.collection("mentor_availability");
+mentorSessionsCollection = db.collection("mentor_sessions");
+
     console.log("Successfully connected to MongoDB!");
     return client;
   } catch (err) {
@@ -721,6 +730,884 @@ app.post("/api/assessments/:id/submit", async (req, res) => {
     res.status(500).json({ success: false, message: "Failed to process submission" });
   }
 });
+
+/* ========================================================
+   17.MENTOR DASHBOARD OVERVIEW API
+======================================================== */
+
+
+/* ========================================================
+   17. MENTOR DASHBOARD OVERVIEW API
+======================================================== */
+
+app.get("/api/mentor/overview", async (req, res) => {
+  try {
+    const db = client.db(process.env.DB_NAME || "skillgraph");
+
+    // Use the same collection initialized in connectToMongoDB().
+    const usersCol = userCollection || db.collection("user");
+
+    // These collections are resolved directly, avoiding
+    // undeclared JavaScript variables.
+    const reviewsCol = db.collection("codeReviews");
+    const sessionsCol = db.collection("advisorySessions");
+
+    const developerQuery = {
+      $or: [
+        { role: { $regex: /^developer$/i } },
+        { type: { $regex: /^developer$/i } },
+        { accountType: { $regex: /^developer$/i } },
+      ],
+    };
+
+    const [
+      activeMenteesCount,
+      mentees,
+      pendingReviewsCount,
+      pendingReviews,
+      upcomingCallsCount,
+      upcomingSessions,
+    ] = await Promise.all([
+      usersCol.countDocuments(developerQuery),
+
+      usersCol
+        .find(developerQuery)
+        .project({
+          name: 1,
+          email: 1,
+          targetCareer: 1,
+          createdAt: 1,
+        })
+        .sort({ createdAt: -1 })
+        .limit(10)
+        .toArray(),
+
+      reviewsCol.countDocuments({
+        status: {
+          $in: ["Pending", "Submitted", "In Review"],
+        },
+      }),
+
+      reviewsCol
+        .find({
+          status: {
+            $in: ["Pending", "Submitted", "In Review"],
+          },
+        })
+        .sort({ createdAt: -1 })
+        .limit(5)
+        .toArray(),
+
+      sessionsCol.countDocuments({
+        status: {
+          $nin: ["Cancelled", "Completed"],
+        },
+      }),
+
+      sessionsCol
+        .find({
+          status: {
+            $nin: ["Cancelled", "Completed"],
+          },
+        })
+        .sort({ date: 1 })
+        .limit(5)
+        .toArray(),
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        activeMenteesCount,
+
+        pendingReviewsCount,
+
+        upcomingCallsCount,
+
+        mentees: mentees.map((m) => ({
+          id: String(m._id),
+          name:
+            m.name ||
+            m.email?.split("@")[0] ||
+            "Developer",
+          career: m.targetCareer || "Not specified",
+          readiness: null,
+          status: "Active",
+        })),
+
+        pendingReviews: pendingReviews.map((r) => ({
+          id: String(r._id),
+          title: r.title || "Code Review",
+          menteeName:
+            r.menteeName ||
+            r.email?.split("@")[0] ||
+            "Developer",
+          milestone: r.milestone || "General Milestone",
+          createdAt: r.createdAt || null,
+        })),
+
+        upcomingSessions: upcomingSessions.map((s) => ({
+          id: String(s._id),
+          title: s.title || "1-on-1 Mentorship Call",
+          menteeName: s.menteeName || "Developer",
+          date: s.date || null,
+          time: s.time || "As scheduled",
+          meetingUrl: s.meetingUrl || "",
+        })),
+      },
+    });
+  } catch (err) {
+    console.error("Failed to load mentor overview:", err);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to load mentor overview",
+      ...(process.env.NODE_ENV === "development" && {
+        debug: err.message,
+      }),
+    });
+  }
+});
+
+
+/* ========================================================
+  18. MENTORS MENTEES DIRECTORY API
+======================================================== */
+  
+
+
+app.get("/api/mentor/mentees", async (req, res) => {
+  try {
+    const db = client.db(process.env.DB_NAME || "skillgraph");
+
+    const usersCol = userCollection || db.collection("user");
+    const progressCol = progressCollection || db.collection("user_progress");
+    const skillProgressCol =
+      userSkillProgressCollection || db.collection("user_skill_progress");
+    const skillsCol = skillsCollection || db.collection("skills");
+    const modulesCol = modulesCollection || db.collection("modules");
+    const historyCol =
+      assessmentHistoryCollection || db.collection("assessment_history");
+
+    const developers = await usersCol
+      .find({ role: { $regex: /^developer$/i } })
+      .project({
+        name: 1,
+        email: 1,
+        targetCareer: 1,
+        createdAt: 1,
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const data = await Promise.all(
+      developers.map(async (dev) => {
+        const email = String(dev.email || "").trim().toLowerCase();
+        const courseSlug = String(dev.targetCareer || "frontend")
+          .trim()
+          .toLowerCase();
+
+        const base = {
+          id: String(dev._id),
+          name: dev.name || email.split("@")[0] || "Developer",
+          email,
+          targetCareer: courseSlug,
+          createdAt: dev.createdAt || null,
+        };
+
+        if (!email) {
+          return {
+            ...base,
+            completedTasks: [],
+            completedTasksCount: 0,
+            totalTasksCount: 0,
+            moduleProgressPercent: 0,
+            assessedSkillsCount: 0,
+            totalSkillsCount: 0,
+            skillAssessmentPercent: 0,
+            targetMatchPercent: 0,
+            readiness: 0,
+            skills: [],
+            skillsCount: 0,
+            completedAssessments: 0,
+            status: "Not assessed",
+          };
+        }
+
+        // Use the developer's selected career, not progress
+        // records from unrelated career pathways.
+        const [progress, modules, careerSkills, skillRecords, completedAssessments] =
+          await Promise.all([
+            progressCol.findOne({ email, courseSlug }),
+
+            modulesCol
+              .find({ courseSlug })
+              .sort({ moduleId: 1 })
+              .toArray(),
+
+            skillsCol.find({ courseSlug }).toArray(),
+
+            skillProgressCol.find({ email, courseSlug }).toArray(),
+
+            historyCol.countDocuments({
+              email,
+              courseSlug,
+              passed: true,
+            }),
+          ]);
+
+        // Same task denominator as DeveloperOverviewPage:
+        // all tasks in all modules for the selected career.
+        const allTasks = modules.flatMap((module) =>
+          Array.isArray(module.tasks) ? module.tasks : []
+        );
+
+        const completedTasks = Array.isArray(progress?.completedTasks)
+          ? [...new Set(progress.completedTasks)]
+          : [];
+
+        const totalTasksCount = allTasks.length;
+        const completedTasksCount = completedTasks.length;
+
+        const moduleProgressPercent = totalTasksCount
+          ? Math.round((completedTasksCount / totalTasksCount) * 100)
+          : 0;
+
+        // The Developer Skills page counts a skill as assessed
+        // when its saved currentLevel is not null or undefined.
+        const assessmentsBySkillId = new Map(
+          skillRecords.map((record) => [
+            String(record.skillId),
+            record,
+          ])
+        );
+
+        const skills = careerSkills.map((skill) => {
+          const skillId = String(skill._id);
+          const record = assessmentsBySkillId.get(skillId);
+
+          const rawLevel = record?.currentLevel;
+          const parsedLevel =
+            rawLevel === null || rawLevel === undefined
+              ? null
+              : Number(rawLevel);
+
+          const currentLevel =
+            Number.isInteger(parsedLevel) &&
+            parsedLevel >= 1 &&
+            parsedLevel <= 5
+              ? parsedLevel
+              : null;
+
+          const targetLevel = Math.min(
+            5,
+            Math.max(1, Number(skill.targetLevel) || 1)
+          );
+
+          const status =
+            currentLevel === null
+              ? "not-assessed"
+              : currentLevel >= targetLevel
+                ? "assessed"
+                : record?.learningStatus === "in-progress"
+                  ? "in-progress"
+                  : "gap";
+
+          return {
+            id: record ? String(record._id) : skillId,
+            skillId,
+            name: skill.name || skill.title || "Unnamed Skill",
+            category: skill.category || "General",
+            currentLevel,
+            targetLevel,
+            status,
+            evidence: record?.evidence || "",
+            assessedAt: record?.assessedAt || null,
+            hasGap:
+              currentLevel !== null && currentLevel < targetLevel,
+          };
+        });
+
+        const totalSkillsCount = careerSkills.length;
+
+        const assessedSkills = skills.filter(
+          (skill) => skill.currentLevel !== null
+        );
+
+        const verifiedSkills = skills.filter(
+          (skill) => skill.status === "assessed"
+        );
+
+        const assessedSkillsCount = assessedSkills.length;
+
+        const skillAssessmentPercent = totalSkillsCount
+          ? Math.round((assessedSkillsCount / totalSkillsCount) * 100)
+          : 0;
+
+        const targetMatchPercent = totalSkillsCount
+          ? Math.round((verifiedSkills.length / totalSkillsCount) * 100)
+          : 0;
+
+        return {
+          ...base,
+
+          // Task progress
+          completedTasks,
+          completedTasksCount,
+          totalTasksCount,
+          moduleProgressPercent,
+
+          // Skill progress
+          skills,
+          skillsCount: totalSkillsCount,
+          assessedSkillsCount,
+          totalSkillsCount,
+          skillAssessmentPercent,
+          targetMatchPercent,
+
+          // Keep this alias if the existing UI uses `readiness`.
+          // It now means task completion, not proficiency.
+          readiness: moduleProgressPercent,
+
+          completedAssessments,
+          status:
+            totalSkillsCount === 0 || assessedSkillsCount === 0
+              ? "Not assessed"
+              : skills.some((skill) => skill.hasGap)
+                ? "Skill gaps"
+                : "On track",
+        };
+      })
+    );
+
+    return res.status(200).json({
+      success: true,
+      count: data.length,
+      data,
+    });
+  } catch (error) {
+    console.error("Failed to fetch mentees directory:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to load mentees directory",
+      ...(process.env.NODE_ENV !== "production" && {
+        debug: error.message,
+      }),
+    });
+  }
+});
+
+// 19. GET ALL CODE REVIEWS
+app.get("/api/mentor/reviews", async (req, res) => {
+  try {
+    const db = client.db(process.env.DB_NAME || "skillgraph");
+    const targetReviewsCol = codeReviewsCollection || db.collection("code_reviews");
+
+    const reviews = await targetReviewsCol.find({}).sort({ createdAt: -1 }).toArray();
+
+    const formattedReviews = reviews.map((r) => ({
+      id: String(r._id),
+      _id: String(r._id),
+      title: r.title || "Code Review Submission",
+      menteeName: r.menteeName || r.email?.split("@")[0] || "Developer",
+      email: r.email || "",
+      milestone: r.milestone || "General Milestone",
+      repoUrl: r.repoUrl || "",
+      notes: r.notes || "",
+      status: r.status || "Pending Review",
+      feedback: r.feedback || "",
+      rubric: r.rubric || {
+        codeQuality: 5,
+        architecture: 5,
+        security: 5,
+        documentation: 5,
+      },
+      createdAt: r.createdAt
+        ? new Date(r.createdAt).toISOString().split("T")[0]
+        : new Date().toISOString().split("T")[0],
+    }));
+
+    res.json({
+      success: true,
+      count: formattedReviews.length,
+      data: formattedReviews,
+    });
+  } catch (err) {
+    console.error("Failed to fetch code reviews:", err);
+    res.status(500).json({ success: false, message: "Failed to fetch code reviews." });
+  }
+});
+
+// 20. PUT / UPDATE CODE REVIEW FEEDBACK & DECISION
+app.put("/api/mentor/reviews", async (req, res) => {
+  try {
+    const db = client.db(process.env.DB_NAME || "skillgraph");
+    const targetReviewsCol = codeReviewsCollection || db.collection("code_reviews");
+
+    const { reviewId, status, feedback, rubric } = req.body;
+
+    if (!reviewId || !ObjectId.isValid(reviewId)) {
+      return res.status(400).json({ success: false, message: "Valid reviewId is required." });
+    }
+
+    const updateData = {
+      status: status || "Approved",
+      feedback: feedback || "",
+      rubric: rubric || {},
+      updatedAt: new Date(),
+    };
+
+    const result = await targetReviewsCol.updateOne(
+      { _id: new ObjectId(reviewId) },
+      { $set: updateData }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ success: false, message: "Review submission not found." });
+    }
+
+    res.json({
+      success: true,
+      message: "Review updated successfully.",
+      data: updateData,
+    });
+  } catch (err) {
+    console.error("Failed to update review:", err);
+    res.status(500).json({ success: false, message: "Failed to save review feedback." });
+  }
+});
+
+
+/* ========================================================
+   MENTOR SESSIONS API
+======================================================== */
+
+const normalizeEmail = (value) =>
+  String(value || "").trim().toLowerCase();
+
+const allowedSessionStatuses = [
+  "pending",
+  "confirmed",
+  "completed",
+  "cancelled",
+];
+
+const allowedActionStatuses = [
+  "todo",
+  "in-progress",
+  "completed",
+];
+
+const isValidDate = (value) =>
+  value && !Number.isNaN(new Date(value).getTime());
+
+async function getMentorByEmail(email) {
+  return userCollection.findOne({
+    email: normalizeEmail(email),
+    role: "mentor",
+  });
+}
+
+// GET mentor availability
+app.get("/api/mentor/sessions/availability", async (req, res) => {
+  try {
+    const mentorEmail = normalizeEmail(req.query.mentorEmail);
+
+    if (!mentorEmail) {
+      return res.status(400).json({
+        message: "Mentor email is required.",
+      });
+    }
+
+    const mentor = await getMentorByEmail(mentorEmail);
+
+    if (!mentor) {
+      return res.status(403).json({
+        message: "Mentor account not found.",
+      });
+    }
+
+    const availability =
+      await mentorAvailabilityCollection.findOne({ mentorEmail });
+
+    res.json({
+      availability: availability || {
+        mentorEmail,
+        timezone: "Asia/Dhaka",
+        durationMinutes: 30,
+        weeklySchedule: [],
+        blockedDates: [],
+      },
+    });
+  } catch (error) {
+    console.error("Get mentor availability:", error);
+    res.status(500).json({
+      message: "Failed to load availability.",
+    });
+  }
+});
+
+// CREATE OR UPDATE mentor availability
+app.put("/api/mentor/sessions/availability", async (req, res) => {
+  try {
+    const mentorEmail = normalizeEmail(req.body.mentorEmail);
+    const { timezone, durationMinutes, weeklySchedule, blockedDates } =
+      req.body;
+
+    if (!mentorEmail) {
+      return res.status(400).json({
+        message: "Mentor email is required.",
+      });
+    }
+
+    const mentor = await getMentorByEmail(mentorEmail);
+
+    if (!mentor) {
+      return res.status(403).json({
+        message: "Only registered mentors can update availability.",
+      });
+    }
+
+    const duration = Number(durationMinutes);
+
+    if (![15, 30, 45, 60].includes(duration)) {
+      return res.status(400).json({
+        message: "Choose a valid session duration.",
+      });
+    }
+
+    if (
+      !Array.isArray(weeklySchedule) ||
+      !Array.isArray(blockedDates)
+    ) {
+      return res.status(400).json({
+        message: "Schedule and blocked dates must be arrays.",
+      });
+    }
+
+    const validDays = [
+      "Sunday",
+      "Monday",
+      "Tuesday",
+      "Wednesday",
+      "Thursday",
+      "Friday",
+      "Saturday",
+    ];
+
+    const validSchedule = weeklySchedule.every(
+      (slot) =>
+        validDays.includes(slot.day) &&
+        /^\d{2}:\d{2}$/.test(slot.startTime) &&
+        /^\d{2}:\d{2}$/.test(slot.endTime) &&
+        slot.startTime < slot.endTime &&
+        Number(slot.startTime.slice(0, 2)) < 24 &&
+        Number(slot.startTime.slice(3, 5)) < 60 &&
+        Number(slot.endTime.slice(0, 2)) < 24 &&
+        Number(slot.endTime.slice(3, 5)) < 60
+    );
+
+    if (!validSchedule) {
+      return res.status(400).json({
+        message: "One or more availability time slots are invalid.",
+      });
+    }
+
+    const document = {
+      mentorEmail,
+      timezone: String(timezone || "Asia/Dhaka"),
+      durationMinutes: duration,
+      weeklySchedule,
+      blockedDates: blockedDates
+        .filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date)),
+      updatedAt: new Date(),
+    };
+
+    await mentorAvailabilityCollection.updateOne(
+      { mentorEmail },
+      {
+        $set: document,
+        $setOnInsert: { createdAt: new Date() },
+      },
+      { upsert: true }
+    );
+
+    res.json({
+      success: true,
+      message: "Availability saved successfully.",
+      availability: document,
+    });
+  } catch (error) {
+    console.error("Save mentor availability:", error);
+    res.status(500).json({
+      message: "Failed to save availability.",
+    });
+  }
+});
+
+// GET mentor's sessions
+app.get("/api/mentor/sessions", async (req, res) => {
+  try {
+    const mentorEmail = normalizeEmail(req.query.mentorEmail);
+    const status = String(req.query.status || "").trim();
+
+    if (!mentorEmail) {
+      return res.status(400).json({
+        message: "Mentor email is required.",
+      });
+    }
+
+    const mentor = await getMentorByEmail(mentorEmail);
+
+    if (!mentor) {
+      return res.status(403).json({
+        message: "Mentor account not found.",
+      });
+    }
+
+    const query = { mentorEmail };
+
+    if (status && allowedSessionStatuses.includes(status)) {
+      query.status = status;
+    }
+
+    const sessions = await mentorSessionsCollection
+      .find(query)
+      .sort({ startAt: 1 })
+      .limit(200)
+      .toArray();
+
+    res.json({ sessions });
+  } catch (error) {
+    console.error("Get mentor sessions:", error);
+    res.status(500).json({
+      message: "Failed to load sessions.",
+    });
+  }
+});
+
+// CREATE a session
+app.post("/api/mentor/sessions", async (req, res) => {
+  try {
+    const mentorEmail = normalizeEmail(req.body.mentorEmail);
+    const menteeEmail = normalizeEmail(req.body.menteeEmail);
+
+    const {
+      title,
+      description,
+      startAt,
+      endAt,
+      meetingLink,
+    } = req.body;
+
+    if (
+      !mentorEmail ||
+      !menteeEmail ||
+      !String(title || "").trim() ||
+      !isValidDate(startAt) ||
+      !isValidDate(endAt)
+    ) {
+      return res.status(400).json({
+        message: "Provide a mentee, topic, start time, and end time.",
+      });
+    }
+
+    const start = new Date(startAt);
+    const end = new Date(endAt);
+
+    if (end <= start || start <= new Date()) {
+      return res.status(400).json({
+        message: "The session must have a future start and valid end time.",
+      });
+    }
+
+    const [mentor, mentee] = await Promise.all([
+      getMentorByEmail(mentorEmail),
+      userCollection.findOne({
+        email: menteeEmail,
+        role: "developer",
+      }),
+    ]);
+
+    if (!mentor) {
+      return res.status(403).json({
+        message: "Only mentors can create sessions.",
+      });
+    }
+
+    if (!mentee) {
+      return res.status(404).json({
+        message: "Developer/mentee account not found.",
+      });
+    }
+
+    // Prevent overlapping sessions for this mentor.
+    const overlap = await mentorSessionsCollection.findOne({
+      mentorEmail,
+      status: { $in: ["pending", "confirmed"] },
+      startAt: { $lt: end },
+      endAt: { $gt: start },
+    });
+
+    if (overlap) {
+      return res.status(409).json({
+        message: "This time overlaps another scheduled session.",
+      });
+    }
+
+    const session = {
+      mentorEmail,
+      menteeEmail,
+      menteeName: mentee.name || menteeEmail,
+      title: String(title).trim().slice(0, 150),
+      description: String(description || "").trim().slice(0, 2000),
+      startAt: start,
+      endAt: end,
+      meetingLink: String(meetingLink || "").trim().slice(0, 1000),
+      status: "pending",
+      notes: "",
+      actionItems: [],
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await mentorSessionsCollection.insertOne(session);
+
+    res.status(201).json({
+      success: true,
+      message: "Session created successfully.",
+      session: { ...session, _id: result.insertedId },
+    });
+  } catch (error) {
+    console.error("Create mentor session:", error);
+    res.status(500).json({
+      message: "Failed to create session.",
+    });
+  }
+});
+
+// UPDATE session status, meeting link, notes, or action items
+app.patch("/api/mentor/sessions/:id", async (req, res) => {
+  try {
+    const mentorEmail = normalizeEmail(req.body.mentorEmail);
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        message: "Invalid session ID.",
+      });
+    }
+
+    const mentor = await getMentorByEmail(mentorEmail);
+
+    if (!mentor) {
+      return res.status(403).json({
+        message: "Mentor account not found.",
+      });
+    }
+
+    const session = await mentorSessionsCollection.findOne({
+      _id: new ObjectId(id),
+      mentorEmail,
+    });
+
+    if (!session) {
+      return res.status(404).json({
+        message: "Session not found.",
+      });
+    }
+
+    const updates = {};
+
+    if (req.body.status !== undefined) {
+      if (!allowedSessionStatuses.includes(req.body.status)) {
+        return res.status(400).json({
+          message: "Invalid session status.",
+        });
+      }
+
+      updates.status = req.body.status;
+    }
+
+    if (req.body.meetingLink !== undefined) {
+      updates.meetingLink = String(req.body.meetingLink)
+        .trim()
+        .slice(0, 1000);
+    }
+
+    if (req.body.notes !== undefined) {
+      updates.notes = String(req.body.notes).slice(0, 10000);
+    }
+
+    if (req.body.actionItems !== undefined) {
+      if (!Array.isArray(req.body.actionItems)) {
+        return res.status(400).json({
+          message: "Action items must be an array.",
+        });
+      }
+
+      if (req.body.actionItems.length > 30) {
+        return res.status(400).json({
+          message: "A session can have up to 30 action items.",
+        });
+      }
+
+      const validItems = req.body.actionItems.every((item) => {
+        const dueDateValid =
+          !item.dueDate ||
+          /^\d{4}-\d{2}-\d{2}$/.test(item.dueDate);
+
+        return (
+          String(item.title || "").trim().length > 0 &&
+          String(item.title).length <= 200 &&
+          allowedActionStatuses.includes(item.status || "todo") &&
+          dueDateValid
+        );
+      });
+
+      if (!validItems) {
+        return res.status(400).json({
+          message: "One or more action items are invalid.",
+        });
+      }
+
+      updates.actionItems = req.body.actionItems.map((item) => ({
+        id: String(item.id || new ObjectId()),
+        title: String(item.title).trim(),
+        description: String(item.description || "").slice(0, 2000),
+        dueDate: item.dueDate || "",
+        status: item.status || "todo",
+      }));
+    }
+
+    updates.updatedAt = new Date();
+
+    await mentorSessionsCollection.updateOne(
+      { _id: session._id, mentorEmail },
+      { $set: updates }
+    );
+
+    const updatedSession = await mentorSessionsCollection.findOne({
+      _id: session._id,
+      mentorEmail,
+    });
+
+    res.json({
+      success: true,
+      message: "Session updated successfully.",
+      session: updatedSession,
+    });
+  } catch (error) {
+    console.error("Update mentor session:", error);
+    res.status(500).json({
+      message: "Failed to update session.",
+    });
+  }
+});
+
+
+
 
 
 // Call this only when application terminates
