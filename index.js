@@ -5,6 +5,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import { MongoClient, ServerApiVersion } from "mongodb";
+import { ObjectId } from "mongodb";
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -24,14 +25,18 @@ const client = new MongoClient(process.env.MONGODB_URI, {
 let coursesCollection;
 let modulesCollection;
 let progressCollection;
+let skillsCollection;
+let userSkillProgressCollection;
 
 export async function connectToMongoDB() {
   try {
     await client.connect();
     const db = client.db(process.env.DB_NAME || "skillgraph");
     coursesCollection = db.collection("courses");
-    modulesCollection = db.collection("modules"); 
+    modulesCollection = db.collection("modules");
     progressCollection = db.collection("user_progress");
+    skillsCollection = db.collection("skills");
+    userSkillProgressCollection = db.collection("user_skill_progress");
     console.log("Successfully connected to MongoDB!");
     return client;
   } catch (err) {
@@ -214,15 +219,196 @@ app.post("/api/progress/toggle", async (req, res) => {
     if (!email || !courseSlug || !taskId) {
       return res.status(400).json({ error: "Missing required fields" });
     }
-    const filter = { email: email.toLowerCase(), courseSlug: courseSlug.toLowerCase() };
+    const filter = {
+      email: email.toLowerCase(),
+      courseSlug: courseSlug.toLowerCase(),
+    };
     const update = completed
-      ? { $addToSet: { completedTasks: taskId }, $set: { updatedAt: new Date() } }
+      ? {
+          $addToSet: { completedTasks: taskId },
+          $set: { updatedAt: new Date() },
+        }
       : { $pull: { completedTasks: taskId }, $set: { updatedAt: new Date() } };
     await progressCollection.updateOne(filter, update, { upsert: true });
     const updated = await progressCollection.findOne(filter);
     res.json({ completedTasks: updated.completedTasks });
   } catch (err) {
     res.status(500).json({ error: "Failed to update progress" });
+  }
+});
+
+/* ========================================================
+   SKILLS API
+======================================================== */
+
+// 9.GET SKILLS BY CAREER
+// Example: GET /api/skills?courseSlug=frontend
+app.get("/api/skills", async (req, res) => {
+  try {
+    const courseSlug = String(req.query.courseSlug || "")
+      .trim()
+      .toLowerCase();
+
+    if (!courseSlug) {
+      return res.status(400).json({
+        success: false,
+        message: "courseSlug query parameter is required",
+      });
+    }
+
+    if (!skillsCollection) {
+      return res.status(503).json({
+        success: false,
+        message: "Skills collection is not initialized",
+      });
+    }
+
+    const skills = await skillsCollection
+      .find({ courseSlug })
+      .sort({ name: 1 })
+      .toArray();
+
+    return res.status(200).json({
+      success: true,
+      count: skills.length,
+      data: skills,
+    });
+  } catch (error) {
+    console.error("Failed to fetch skills:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch skills",
+    });
+  }
+});
+
+/*10 GET saved assessments for one user and career */
+app.get("/api/skill-progress/:email", async (req, res) => {
+  try {
+    const email = String(req.params.email || "")
+      .trim()
+      .toLowerCase();
+    const courseSlug = String(req.query.courseSlug || "")
+      .trim()
+      .toLowerCase();
+
+    if (!email || !courseSlug) {
+      return res.status(400).json({
+        success: false,
+        message: "Email and courseSlug are required.",
+      });
+    }
+
+    const assessments = await userSkillProgressCollection
+      .find({ email, courseSlug })
+      .toArray();
+
+    return res.status(200).json({
+      success: true,
+      data: assessments,
+    });
+  } catch (error) {
+    console.error("Failed to fetch skill assessments:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch skill assessments.",
+    });
+  }
+});
+
+/* 11. SAVE or update one skill assessment */
+app.put("/api/skill-progress", async (req, res) => {
+  try {
+    const email = String(req.body.email || "")
+      .trim()
+      .toLowerCase();
+
+    const courseSlug = String(req.body.courseSlug || "")
+      .trim()
+      .toLowerCase();
+
+    const skillId = String(req.body.skillId || "").trim();
+    const currentLevel = Number(req.body.currentLevel);
+    const evidence = String(req.body.evidence || "").trim();
+
+    const learningStatus = String(req.body.learningStatus || "gap").trim();
+
+    const allowedLearningStatuses = ["gap", "in-progress"];
+
+    if (
+      !email ||
+      !courseSlug ||
+      !ObjectId.isValid(skillId) ||
+      !Number.isInteger(currentLevel) ||
+      currentLevel < 1 ||
+      currentLevel > 5 ||
+      !allowedLearningStatuses.includes(learningStatus)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Provide valid skill details, a level from 1 to 5, and a valid learning status.",
+      });
+    }
+
+    // Confirm that this skill exists for the selected career.
+    const skill = await skillsCollection.findOne({
+      _id: new ObjectId(skillId),
+      courseSlug,
+    });
+
+    if (!skill) {
+      return res.status(404).json({
+        success: false,
+        message: "Skill not found for this career.",
+      });
+    }
+
+    const targetLevel = Number(skill.targetLevel) || 1;
+    const assessedAt = new Date();
+
+    // A skill meeting its target is always assessed.
+    const status =
+      currentLevel >= targetLevel
+        ? "assessed"
+        : learningStatus === "in-progress"
+          ? "in-progress"
+          : "gap";
+
+    const assessmentData = {
+      email,
+      courseSlug,
+      skillId,
+      currentLevel,
+      targetLevel,
+      evidence,
+      learningStatus,
+      status,
+      assessedAt,
+    };
+
+    await userSkillProgressCollection.updateOne(
+      { email, courseSlug, skillId },
+      {
+        $set: assessmentData,
+      },
+      { upsert: true },
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Skill assessment saved successfully.",
+      data: assessmentData,
+    });
+  } catch (error) {
+    console.error("Failed to save skill assessment:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to save skill assessment.",
+    });
   }
 });
 
