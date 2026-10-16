@@ -33,12 +33,16 @@ let userCollection;
 let codeReviewsCollection;
 let mentorAvailabilityCollection;
 let mentorSessionsCollection;
+let quizzesCollection;
+let challengesCollection;
+let quizSessionsCollection;
+let challengeProgressCollection;
 
 export async function connectToMongoDB() {
   try {
     await client.connect();
     const db = client.db(process.env.DB_NAME || "skillgraph");
-    userCollection = db.collection("user")
+    userCollection = db.collection("user");
     coursesCollection = db.collection("courses");
     modulesCollection = db.collection("modules");
     progressCollection = db.collection("user_progress");
@@ -48,7 +52,33 @@ export async function connectToMongoDB() {
     assessmentHistoryCollection = db.collection("assessment_history");
     codeReviewsCollection = db.collection("code_reviews");
     mentorAvailabilityCollection = db.collection("mentor_availability");
-mentorSessionsCollection = db.collection("mentor_sessions");
+    mentorSessionsCollection = db.collection("mentor_sessions");
+    const existingNames = new Set(
+      (await db.listCollections({}, { nameOnly: true }).toArray()).map(
+        (item) => item.name,
+      ),
+    );
+    const pickName = (candidates) =>
+      candidates.find((name) => existingNames.has(name)) || candidates[0];
+
+    quizzesCollection = db.collection(
+      process.env.QUIZZES_COLLECTION || pickName(["quizzes", "quizes", "quiz"]),
+    );
+    challengesCollection = db.collection(
+      process.env.CHALLENGES_COLLECTION ||
+        pickName([
+          "coding-challenges",
+          "coding_challenges",
+          "codingChallenges",
+          "challenges",
+        ]),
+    );
+    quizSessionsCollection = db.collection("quiz_sessions");
+    challengeProgressCollection = db.collection("challenge_progress");
+
+    console.log(
+      `Assessments using "${quizzesCollection.collectionName}" and "${challengesCollection.collectionName}"`,
+    );
 
     console.log("Successfully connected to MongoDB!");
     return client;
@@ -524,9 +554,7 @@ app.get("/api/roadmap", async (req, res) => {
         totalSkills: roadmap.length,
         totalModules: new Set(
           roadmap.flatMap((skill) =>
-            skill.modules.map(
-              (module) => `${courseSlug}:${module.moduleId}`,
-            ),
+            skill.modules.map((module) => `${courseSlug}:${module.moduleId}`),
           ),
         ).size,
         totalTasks: allTasks.length,
@@ -551,193 +579,640 @@ app.get("/api/roadmap", async (req, res) => {
 /* ========================================================
    ASSESSMENTS APIS (QUIZZES & CODING CHALLENGES)
 ======================================================== */
+const BADGE_TIERS = [
+  { name: "Gold", min: 90 },
+  { name: "Silver", min: 75 },
+  { name: "Bronze", min: 60 },
+];
+const QUIZ_WEIGHT = 0.7;
+const CHALLENGE_WEIGHT = 0.3;
+const DEFAULT_PASS_MARK = 70;
+const SUBMIT_GRACE_SECONDS = 30; // network delay allowance on timed quizzes
 
-// 13. GET ALL ASSESSMENTS BY COURSE SLUG
-app.get("/api/assessments", async (req, res) => {
+const cleanEmail = (value) => String(value || "").trim().toLowerCase();
+const cleanSlug = (value) => String(value || "").trim().toLowerCase();
+
+// Quiz questions may store the answer under any of these names.
+function correctIndexOf(question) {
+  for (const key of ["correctIndex", "correctOption", "correctAnswer"]) {
+    const raw = question?.[key];
+    if (raw === undefined || raw === null) continue;
+    const n = Number(raw);
+    if (Number.isInteger(n)) return n;
+  }
+  return -1;
+}
+
+const questionKey = (question, index) =>
+  String(question.id ?? question._id ?? index);
+
+// Roadmap completion -> decides whether the final quiz is unlocked.
+async function getRoadmapProgress(email, courseSlug) {
+  const [modules, progress] = await Promise.all([
+    modulesCollection.find({ courseSlug }).project({ tasks: 1 }).toArray(),
+    progressCollection.findOne({ email, courseSlug }),
+  ]);
+
+  const taskIds = new Set(
+    modules
+      .flatMap((module) => (Array.isArray(module.tasks) ? module.tasks : []))
+      .map((task) => task?.id)
+      .filter(Boolean),
+  );
+
+  const done = new Set(
+    Array.isArray(progress?.completedTasks) ? progress.completedTasks : [],
+  );
+
+  const totalTasks = taskIds.size;
+  const completedTasks = [...taskIds].filter((id) => done.has(id)).length;
+
+  return {
+    totalTasks,
+    completedTasks,
+    percentage: totalTasks
+      ? Math.round((completedTasks / totalTasks) * 100)
+      : 0,
+    unlocked: totalTasks > 0 && completedTasks >= totalTasks,
+  };
+}
+
+// Badge = 70% best quiz score + 30% share of coding challenges solved.
+async function computeBadge(email, courseSlug, quizHistory) {
+  const history =
+    quizHistory !== undefined
+      ? quizHistory
+      : await assessmentHistoryCollection.findOne({
+          email,
+          courseSlug,
+          kind: "quiz",
+        });
+
+  const [totalChallenges, solvedChallenges] = await Promise.all([
+    challengesCollection.countDocuments({ courseSlug }),
+    challengeProgressCollection.countDocuments({
+      email,
+      courseSlug,
+      solved: true,
+    }),
+  ]);
+
+  const quizBest = Math.round(Number(history?.bestScore) || 0);
+  const quizPassed = Boolean(history?.passed);
+
+  const challengePct = totalChallenges
+    ? Math.round(
+        (Math.min(solvedChallenges, totalChallenges) / totalChallenges) * 100,
+      )
+    : 0;
+
+  const score = Math.round(
+    quizBest * QUIZ_WEIGHT + challengePct * CHALLENGE_WEIGHT,
+  );
+
+  // A badge needs a passed quiz AND a high enough overall score.
+  const tier = quizPassed
+    ? (BADGE_TIERS.find((item) => score >= item.min)?.name ?? null)
+    : null;
+
+  // Lowest tier that is still above the current score.
+  const next = [...BADGE_TIERS].reverse().find((item) => item.min > score);
+
+  return {
+    tier,
+    score,
+    quizBest,
+    challengePct,
+    tiers: BADGE_TIERS,
+    nextTier: next
+      ? { name: next.name, pointsNeeded: next.min - score }
+      : null,
+  };
+}
+
+/* ---------- OVERVIEW: everything the hub page needs in one call ---------- */
+// 12.GET /api/assessments/overview?
+app.get("/api/assessments/overview", async (req, res) => {
   try {
-    const courseSlug = String(req.query.courseSlug || "frontend")
+    const email = cleanEmail(req.query.email);
+    const courseSlug = cleanSlug(req.query.courseSlug);
+
+    if (!email || !courseSlug) {
+      return res.status(400).json({
+        success: false,
+        message: "email and courseSlug are required.",
+      });
+    }
+
+    const [progress, quizDoc, quizHistory, challenges, challengeRows] =
+      await Promise.all([
+        getRoadmapProgress(email, courseSlug),
+        quizzesCollection.findOne({ courseSlug }),
+        assessmentHistoryCollection.findOne({
+          email,
+          courseSlug,
+          kind: "quiz",
+        }),
+        challengesCollection
+          .find({ courseSlug })
+          .project({
+            title: 1,
+            description: 1,
+            skillName: 1,
+            difficulty: 1,
+            language: 1,
+          })
+          .sort({ title: 1 })
+          .toArray(),
+        challengeProgressCollection.find({ email, courseSlug }).toArray(),
+      ]);
+
+    const badge = await computeBadge(email, courseSlug, quizHistory);
+    const rowsByChallenge = new Map(
+      challengeRows.map((row) => [String(row.challengeId), row]),
+    );
+
+    const quiz = quizDoc
+      ? {
+          _id: String(quizDoc._id),
+          title: quizDoc.title || "Final Quiz",
+          description: quizDoc.description || "",
+          questionCount: Array.isArray(quizDoc.questions)
+            ? quizDoc.questions.length
+            : 0,
+          timeLimitMinutes: Number(quizDoc.timeLimitMinutes) || 0,
+          passMark: Number(quizDoc.passMark) || DEFAULT_PASS_MARK,
+          attempts: quizHistory?.attempts || 0,
+          bestScore: Math.round(quizHistory?.bestScore || 0),
+          passed: Boolean(quizHistory?.passed),
+          lastAttemptAt: quizHistory?.lastAttemptAt || null,
+        }
+      : null;
+
+    return res.json({
+      success: true,
+      data: {
+        progress,
+        quiz,
+        badge,
+        challenges: challenges.map((item) => {
+          const row = rowsByChallenge.get(String(item._id));
+          return {
+            _id: String(item._id),
+            title: item.title || "Untitled challenge",
+            description: item.description || "",
+            skillName: item.skillName || "",
+            difficulty: item.difficulty || "Intermediate",
+            language: item.language || "JavaScript",
+            solved: Boolean(row?.solved),
+            attempts: row?.attempts || 0,
+            lastAttemptAt: row?.lastAttemptAt || null,
+          };
+        }),
+      },
+    });
+  } catch (error) {
+    console.error("Failed to load assessments overview:", error);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to load assessments." });
+  }
+});
+
+/* ---------- START the final quiz (server-enforced unlock + timer) -------- */
+// 13.POST /api/assessments/quiz/start   { email, courseSlug }
+app.post("/api/assessments/quiz/start", async (req, res) => {
+  try {
+    const email = cleanEmail(req.body.email);
+    const courseSlug = cleanSlug(req.body.courseSlug);
+
+    if (!email || !courseSlug) {
+      return res.status(400).json({
+        success: false,
+        message: "email and courseSlug are required.",
+      });
+    }
+
+    const quizDoc = await quizzesCollection.findOne({ courseSlug });
+    const questions = Array.isArray(quizDoc?.questions) ? quizDoc.questions : [];
+
+    if (!quizDoc || questions.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "No final quiz is available for this career yet.",
+      });
+    }
+
+    const progress = await getRoadmapProgress(email, courseSlug);
+
+    if (!progress.unlocked) {
+      return res.status(403).json({
+        success: false,
+        message: "Complete every roadmap task to unlock the final quiz.",
+      });
+    }
+
+    const timeLimitMinutes = Number(quizDoc.timeLimitMinutes) || 0;
+    const passMark = Number(quizDoc.passMark) || DEFAULT_PASS_MARK;
+    const now = new Date();
+
+    // Drop abandoned, unsubmitted attempts so sessions don't pile up.
+    await quizSessionsCollection.deleteMany({
+      email,
+      courseSlug,
+      submittedAt: null,
+    });
+
+    const session = await quizSessionsCollection.insertOne({
+      email,
+      courseSlug,
+      quizId: quizDoc._id,
+      questionIds: questions.map(questionKey),
+      startedAt: now,
+      deadline: timeLimitMinutes
+        ? new Date(now.getTime() + timeLimitMinutes * 60 * 1000)
+        : null,
+      submittedAt: null,
+    });
+
+    // Never send the correct answers or explanations to the browser.
+    return res.json({
+      success: true,
+      data: {
+        sessionId: String(session.insertedId),
+        quiz: {
+          title: quizDoc.title || "Final Quiz",
+          timeLimitMinutes,
+          passMark,
+        },
+        questions: questions.map((question, index) => ({
+          id: questionKey(question, index),
+          prompt: question.prompt || question.question || question.title || "",
+          code: question.code || "",
+          options: Array.isArray(question.options)
+            ? question.options.map(String)
+            : [],
+        })),
+      },
+    });
+  } catch (error) {
+    console.error("Failed to start final quiz:", error);
+    return res
+      .status(500)
+      .json({ success: false, message: "Could not start the final quiz." });
+  }
+});
+
+//14. POST /api/assessments/quiz/submit
+//   { email, sessionId, answers:[{ questionId, answer }] }
+app.post("/api/assessments/quiz/submit", async (req, res) => {
+  try {
+    const email = cleanEmail(req.body.email);
+    const sessionId = String(req.body.sessionId || "");
+    const answers = Array.isArray(req.body.answers) ? req.body.answers : [];
+
+    if (!email || !ObjectId.isValid(sessionId)) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid submission." });
+    }
+
+    // Claim the session atomically so it can only be graded once.
+    const now = new Date();
+    const claimed = await quizSessionsCollection.findOneAndUpdate(
+      { _id: new ObjectId(sessionId), email, submittedAt: null },
+      { $set: { submittedAt: now } },
+    );
+    const session = claimed?.value !== undefined ? claimed.value : claimed;
+
+    if (!session) {
+      return res.status(409).json({
+        success: false,
+        message: "This quiz attempt was already submitted or doesn't exist.",
+      });
+    }
+
+    if (
+      session.deadline &&
+      now.getTime() > session.deadline.getTime() + SUBMIT_GRACE_SECONDS * 1000
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Time limit exceeded. Please start a new attempt.",
+      });
+    }
+
+    const quizDoc = await quizzesCollection.findOne({ _id: session.quizId });
+
+    if (!quizDoc) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Quiz no longer exists." });
+    }
+
+    const questionsByKey = new Map(
+      (quizDoc.questions || []).map((question, index) => [
+        questionKey(question, index),
+        question,
+      ]),
+    );
+
+    const answersByKey = new Map(
+      answers.map((entry) => [String(entry?.questionId), entry?.answer]),
+    );
+
+    let score = 0;
+
+    const results = session.questionIds.map((key) => {
+      const question = questionsByKey.get(key);
+      const correctIndex = question ? correctIndexOf(question) : -1;
+      const given = answersByKey.get(key);
+      const correct = Number.isInteger(given) && given === correctIndex;
+
+      if (correct) score += 1;
+
+      return {
+        questionId: key,
+        correct,
+        correctIndex,
+        explanation: question?.explanation || "",
+      };
+    });
+
+    const total = session.questionIds.length;
+    const percentage = total ? Math.round((score / total) * 100) : 0;
+    const passMark = Number(quizDoc.passMark) || DEFAULT_PASS_MARK;
+    const passed = percentage >= passMark;
+
+    // Keep one history document per user + career for the final quiz.
+    await assessmentHistoryCollection.updateOne(
+      { email, courseSlug: session.courseSlug, kind: "quiz" },
+      {
+        $inc: { attempts: 1 },
+        $max: { bestScore: percentage },
+        $set: {
+          quizId: String(session.quizId),
+          lastScore: percentage,
+          lastAttemptAt: now,
+          ...(passed ? { passed: true } : {}),
+        },
+        ...(passed ? {} : { $setOnInsert: { passed: false } }),
+      },
+      { upsert: true },
+    );
+
+    const badge = await computeBadge(email, session.courseSlug);
+
+    return res.json({
+      success: true,
+      data: { score, total, percentage, passed, passMark, badge, results },
+    });
+  } catch (error) {
+    console.error("Failed to submit final quiz:", error);
+    return res
+      .status(500)
+      .json({ success: false, message: "Could not submit the quiz." });
+  }
+});
+
+
+//15. GET /api/assessments/challenges/:id
+app.get("/api/assessments/challenges/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid challenge ID." });
+    }
+
+    const challenge = await challengesCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!challenge) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Challenge not found." });
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        _id: String(challenge._id),
+        title: challenge.title || "Untitled challenge",
+        difficulty: challenge.difficulty || "Intermediate",
+        skillName: challenge.skillName || "",
+        language: challenge.language || "JavaScript",
+        prompt: challenge.prompt || challenge.description || "",
+        examples: Array.isArray(challenge.examples) ? challenge.examples : [],
+        constraints: Array.isArray(challenge.constraints)
+          ? challenge.constraints
+          : [],
+        functionName: challenge.functionName || "solution",
+        starterCode: challenge.starterCode || "",
+        tests: (Array.isArray(challenge.tests) ? challenge.tests : []).map(
+          (test) => {
+            const rawArgs = test.args ?? test.input;
+            return {
+              args: Array.isArray(rawArgs)
+                ? rawArgs
+                : rawArgs === undefined
+                  ? []
+                  : [rawArgs],
+              expected: test.expected ?? test.output,
+            };
+          },
+        ),
+      },
+    });
+  } catch (error) {
+    console.error("Failed to load challenge:", error);
+    return res
+      .status(500)
+      .json({ success: false, message: "Could not load this challenge." });
+  }
+});
+
+
+// 16.POST /api/assessments/challenges/:id/submit   { email, passedTests, code }
+app.post("/api/assessments/challenges/:id/submit", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const email = cleanEmail(req.body.email);
+
+    if (!email || !ObjectId.isValid(id)) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid submission." });
+    }
+
+    const challenge = await challengesCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!challenge) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Challenge not found." });
+    }
+
+    // Trust the stored number of tests, not the one sent by the browser.
+    const totalTests = Array.isArray(challenge.tests)
+      ? challenge.tests.length
+      : 0;
+    const passedTests = Math.min(
+      totalTests,
+      Math.max(0, Math.floor(Number(req.body.passedTests) || 0)),
+    );
+    const solvedNow = totalTests > 0 && passedTests === totalTests;
+    const courseSlug = cleanSlug(challenge.courseSlug || req.body.courseSlug);
+    const now = new Date();
+
+    const filter = { email, challengeId: String(challenge._id) };
+
+    const existing = await challengeProgressCollection.findOne(filter);
+
+    await challengeProgressCollection.updateOne(
+      filter,
+      {
+        $inc: { attempts: 1 },
+        $max: { bestPassed: passedTests },
+        $set: {
+          courseSlug,
+          totalTests,
+          lastPassed: passedTests,
+          lastAttemptAt: now,
+          lastCode: String(req.body.code || "").slice(0, 20000),
+          // Once solved, a later failing attempt must not un-solve it.
+          solved: Boolean(existing?.solved) || solvedNow,
+        },
+      },
+      { upsert: true },
+    );
+
+    return res.json({
+      success: true,
+      data: {
+        solved: solvedNow,
+        passedTests,
+        totalTests,
+        badge: await computeBadge(email, courseSlug),
+      },
+    });
+  } catch (error) {
+    console.error("Failed to submit challenge:", error);
+    return res
+      .status(500)
+      .json({ success: false, message: "Could not save your submission." });
+  }
+});
+
+
+//17. GET developer mentorship dashboard data
+app.get("/api/developer/mentorship", async (req, res) => {
+  try {
+    const email = String(req.query.email || "")
       .trim()
       .toLowerCase();
 
-    const assessments = await assessmentsCollection
-      .find({ courseSlug })
-      .toArray();
-
-    res.json({
-      success: true,
-      data: assessments,
-    });
-  } catch (err) {
-    console.error("Failed to fetch assessments:", err);
-    res.status(500).json({ success: false, message: "Failed to fetch assessments" });
-  }
-});
-
-// 14. GET USER ASSESSMENT HISTORY & ATTEMPTS
-app.get("/api/assessments/history/:email", async (req, res) => {
-  try {
-    const email = String(req.params.email || "").trim().toLowerCase();
-    const courseSlug = String(req.query.courseSlug || "").trim().toLowerCase();
-
-    const history = await assessmentHistoryCollection
-      .find({ email, courseSlug })
-      .toArray();
-
-    res.json({
-      success: true,
-      data: history,
-    });
-  } catch (err) {
-    console.error("Failed to fetch assessment history:", err);
-    res.status(500).json({ success: false, message: "Failed to fetch history" });
-  }
-});
-
-// 15. GET SINGLE ASSESSMENT WITH QUESTIONS (WITHOUT REVEALING CORRECT ANSWERS)
-app.get("/api/assessments/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid assessment ID" });
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        message: "Developer email is required.",
+      });
     }
 
-    const assessment = await assessmentsCollection.findOne({ _id: new ObjectId(id) });
-    if (!assessment) {
-      return res.status(404).json({ success: false, message: "Assessment not found" });
+    const db = client.db(process.env.DB_NAME || "skillgraph");
+
+    const users = userCollection || db.collection("user");
+    const reviews =
+      codeReviewsCollection || db.collection("code_reviews");
+    const sessions =
+      mentorSessionsCollection || db.collection("mentor_sessions");
+
+    const developer = await users.findOne({ email });
+
+    if (!developer) {
+      return res.status(404).json({
+        success: false,
+        message: "Developer account not found.",
+      });
     }
 
-    // Strip out correct answers before sending questions to the client
-    const sanitizedQuestions = (assessment.questions || []).map((q, index) => ({
-      _id: q._id || index,
-      type: q.type || "mcq",
-      title: q.title || "",
-      prompt: q.prompt || "",
-      code: q.code || "",
-      difficulty: q.difficulty || assessment.difficulty,
-      options: q.options || [],
-      examples: q.examples || [],
-      constraints: q.constraints || [],
-      starterCode: q.starterCode || "",
-    }));
+    const [reviewData, sessionData] = await Promise.all([
+      reviews
+        .find({ email })
+        .sort({ createdAt: -1 })
+        .limit(50)
+        .toArray(),
 
-    res.json({
+      sessions
+        .find({ menteeEmail: email })
+        .sort({ startAt: 1 })
+        .limit(50)
+        .toArray(),
+    ]);
+
+    const mentorEmail = String(
+      developer.assignedMentorEmail ||
+      developer.mentorEmail ||
+      ""
+    ).trim().toLowerCase();
+
+    const mentor = mentorEmail
+      ? await users.findOne({
+          email: mentorEmail,
+          role: "mentor",
+        })
+      : null;
+
+    return res.json({
       success: true,
       data: {
-        ...assessment,
-        questions: sanitizedQuestions,
+        mentor: mentor
+          ? {
+              name: mentor.name || "Mentor",
+              email: mentor.email,
+              expertise: mentor.expertise || "Software Development Mentor",
+              avatar: mentor.image || mentor.avatar || "",
+            }
+          : null,
+
+        reviews: reviewData.map((review) => ({
+          id: String(review._id),
+          title: review.title || "Code Review",
+          milestone: review.milestone || "General Milestone",
+          status: review.status || "Pending Review",
+          repoUrl: review.repoUrl || "",
+          feedback: review.feedback || "",
+          createdAt: review.createdAt || null,
+        })),
+
+        messages: [],
+
+        sessions: sessionData.map((session) => ({
+          id: String(session._id),
+          title: session.title || "Mentorship Session",
+          date: session.startAt || session.date || null,
+          time: session.time || "",
+          meetingUrl: session.meetingLink || session.meetingUrl || "",
+        })),
       },
     });
-  } catch (err) {
-    console.error("Failed to fetch assessment details:", err);
-    res.status(500).json({ success: false, message: "Failed to load assessment" });
-  }
-});
+  } catch (error) {
+    console.error("Failed to load developer mentorship:", error);
 
-// 16. SUBMIT ASSESSMENT AND GRADE ANSWERS
-app.post("/api/assessments/:id/submit", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { email, courseSlug, answers, durationSeconds } = req.body;
-
-    if (!email || !ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid submission data" });
-    }
-
-    const assessment = await assessmentsCollection.findOne({ _id: new ObjectId(id) });
-    if (!assessment) {
-      return res.status(404).json({ success: false, message: "Assessment not found" });
-    }
-
-    const questions = assessment.questions || [];
-    let correctCount = 0;
-
-    questions.forEach((q, idx) => {
-      const userAns = answers.find(
-        (a) => String(a.questionId) === String(q._id || idx)
-      )?.answer;
-
-      if (q.type === "coding") {
-        // Basic check: awarded if user provided non-empty code solution
-        if (typeof userAns === "string" && userAns.trim().length > 10) {
-          correctCount++;
-        }
-      } else {
-        // MCQ check against correctOption index
-        if (Number(userAns) === Number(q.correctOption)) {
-          correctCount++;
-        }
-      }
+    return res.status(500).json({
+      success: false,
+      message: "Failed to load mentorship data.",
     });
-
-    const totalQuestions = questions.length || 1;
-    const percentage = Math.round((correctCount / totalQuestions) * 100);
-    const passMark = Number(assessment.passMark) || 70;
-    const passed = percentage >= passMark;
-
-    const resultRecord = {
-      assessmentId: String(assessment._id),
-      email: email.toLowerCase(),
-      courseSlug: (courseSlug || assessment.courseSlug || "frontend").toLowerCase(),
-      percentage,
-      correctCount,
-      totalQuestions,
-      passed,
-      durationSeconds: Number(durationSeconds) || 0,
-      completedAt: new Date(),
-    };
-
-    // Update or insert into user assessment history
-    const existingHistory = await assessmentHistoryCollection.findOne({
-      email: resultRecord.email,
-      assessmentId: resultRecord.assessmentId,
-    });
-
-    const attempts = (existingHistory?.attempts || 0) + 1;
-    const bestScore = Math.max(existingHistory?.bestScore || 0, percentage);
-    const everPassed = Boolean(existingHistory?.passed || passed);
-
-    await assessmentHistoryCollection.updateOne(
-      { email: resultRecord.email, assessmentId: resultRecord.assessmentId },
-      {
-        $set: {
-          ...resultRecord,
-          attempts,
-          bestScore,
-          passed: everPassed,
-          badge: everPassed
-            ? {
-                name: assessment.badgeName || `${assessment.title} Badge`,
-                earnedAt: existingHistory?.badge?.earnedAt || new Date(),
-              }
-            : null,
-        },
-      },
-      { upsert: true }
-    );
-
-    res.json({
-      success: true,
-      data: {
-        percentage,
-        correctCount,
-        totalQuestions,
-        passed,
-        badge: everPassed ? { name: assessment.badgeName } : null,
-      },
-    });
-  } catch (err) {
-    console.error("Failed to grade assessment:", err);
-    res.status(500).json({ success: false, message: "Failed to process submission" });
   }
 });
 
 /* ========================================================
-   17.MENTOR DASHBOARD OVERVIEW API
-======================================================== */
-
-
-/* ========================================================
-   17. MENTOR DASHBOARD OVERVIEW API
+   18. MENTOR DASHBOARD OVERVIEW API
 ======================================================== */
 
 app.get("/api/mentor/overview", async (req, res) => {
@@ -826,10 +1301,7 @@ app.get("/api/mentor/overview", async (req, res) => {
 
         mentees: mentees.map((m) => ({
           id: String(m._id),
-          name:
-            m.name ||
-            m.email?.split("@")[0] ||
-            "Developer",
+          name: m.name || m.email?.split("@")[0] || "Developer",
           career: m.targetCareer || "Not specified",
           readiness: null,
           status: "Active",
@@ -838,10 +1310,7 @@ app.get("/api/mentor/overview", async (req, res) => {
         pendingReviews: pendingReviews.map((r) => ({
           id: String(r._id),
           title: r.title || "Code Review",
-          menteeName:
-            r.menteeName ||
-            r.email?.split("@")[0] ||
-            "Developer",
+          menteeName: r.menteeName || r.email?.split("@")[0] || "Developer",
           milestone: r.milestone || "General Milestone",
           createdAt: r.createdAt || null,
         })),
@@ -869,12 +1338,9 @@ app.get("/api/mentor/overview", async (req, res) => {
   }
 });
 
-
 /* ========================================================
-  18. MENTORS MENTEES DIRECTORY API
+  19. MENTORS MENTEES DIRECTORY API
 ======================================================== */
-  
-
 
 app.get("/api/mentor/mentees", async (req, res) => {
   try {
@@ -902,7 +1368,9 @@ app.get("/api/mentor/mentees", async (req, res) => {
 
     const data = await Promise.all(
       developers.map(async (dev) => {
-        const email = String(dev.email || "").trim().toLowerCase();
+        const email = String(dev.email || "")
+          .trim()
+          .toLowerCase();
         const courseSlug = String(dev.targetCareer || "frontend")
           .trim()
           .toLowerCase();
@@ -936,30 +1404,32 @@ app.get("/api/mentor/mentees", async (req, res) => {
 
         // Use the developer's selected career, not progress
         // records from unrelated career pathways.
-        const [progress, modules, careerSkills, skillRecords, completedAssessments] =
-          await Promise.all([
-            progressCol.findOne({ email, courseSlug }),
+        const [
+          progress,
+          modules,
+          careerSkills,
+          skillRecords,
+          completedAssessments,
+        ] = await Promise.all([
+          progressCol.findOne({ email, courseSlug }),
 
-            modulesCol
-              .find({ courseSlug })
-              .sort({ moduleId: 1 })
-              .toArray(),
+          modulesCol.find({ courseSlug }).sort({ moduleId: 1 }).toArray(),
 
-            skillsCol.find({ courseSlug }).toArray(),
+          skillsCol.find({ courseSlug }).toArray(),
 
-            skillProgressCol.find({ email, courseSlug }).toArray(),
+          skillProgressCol.find({ email, courseSlug }).toArray(),
 
-            historyCol.countDocuments({
-              email,
-              courseSlug,
-              passed: true,
-            }),
-          ]);
+          historyCol.countDocuments({
+            email,
+            courseSlug,
+            passed: true,
+          }),
+        ]);
 
         // Same task denominator as DeveloperOverviewPage:
         // all tasks in all modules for the selected career.
         const allTasks = modules.flatMap((module) =>
-          Array.isArray(module.tasks) ? module.tasks : []
+          Array.isArray(module.tasks) ? module.tasks : [],
         );
 
         const completedTasks = Array.isArray(progress?.completedTasks)
@@ -976,10 +1446,7 @@ app.get("/api/mentor/mentees", async (req, res) => {
         // The Developer Skills page counts a skill as assessed
         // when its saved currentLevel is not null or undefined.
         const assessmentsBySkillId = new Map(
-          skillRecords.map((record) => [
-            String(record.skillId),
-            record,
-          ])
+          skillRecords.map((record) => [String(record.skillId), record]),
         );
 
         const skills = careerSkills.map((skill) => {
@@ -1001,7 +1468,7 @@ app.get("/api/mentor/mentees", async (req, res) => {
 
           const targetLevel = Math.min(
             5,
-            Math.max(1, Number(skill.targetLevel) || 1)
+            Math.max(1, Number(skill.targetLevel) || 1),
           );
 
           const status =
@@ -1023,19 +1490,18 @@ app.get("/api/mentor/mentees", async (req, res) => {
             status,
             evidence: record?.evidence || "",
             assessedAt: record?.assessedAt || null,
-            hasGap:
-              currentLevel !== null && currentLevel < targetLevel,
+            hasGap: currentLevel !== null && currentLevel < targetLevel,
           };
         });
 
         const totalSkillsCount = careerSkills.length;
 
         const assessedSkills = skills.filter(
-          (skill) => skill.currentLevel !== null
+          (skill) => skill.currentLevel !== null,
         );
 
         const verifiedSkills = skills.filter(
-          (skill) => skill.status === "assessed"
+          (skill) => skill.status === "assessed",
         );
 
         const assessedSkillsCount = assessedSkills.length;
@@ -1077,7 +1543,7 @@ app.get("/api/mentor/mentees", async (req, res) => {
                 ? "Skill gaps"
                 : "On track",
         };
-      })
+      }),
     );
 
     return res.status(200).json({
@@ -1098,13 +1564,17 @@ app.get("/api/mentor/mentees", async (req, res) => {
   }
 });
 
-// 19. GET ALL CODE REVIEWS
+// 20. GET ALL CODE REVIEWS
 app.get("/api/mentor/reviews", async (req, res) => {
   try {
     const db = client.db(process.env.DB_NAME || "skillgraph");
-    const targetReviewsCol = codeReviewsCollection || db.collection("code_reviews");
+    const targetReviewsCol =
+      codeReviewsCollection || db.collection("code_reviews");
 
-    const reviews = await targetReviewsCol.find({}).sort({ createdAt: -1 }).toArray();
+    const reviews = await targetReviewsCol
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
 
     const formattedReviews = reviews.map((r) => ({
       id: String(r._id),
@@ -1135,20 +1605,25 @@ app.get("/api/mentor/reviews", async (req, res) => {
     });
   } catch (err) {
     console.error("Failed to fetch code reviews:", err);
-    res.status(500).json({ success: false, message: "Failed to fetch code reviews." });
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch code reviews." });
   }
 });
 
-// 20. PUT / UPDATE CODE REVIEW FEEDBACK & DECISION
+// 21. PUT / UPDATE CODE REVIEW FEEDBACK & DECISION
 app.put("/api/mentor/reviews", async (req, res) => {
   try {
     const db = client.db(process.env.DB_NAME || "skillgraph");
-    const targetReviewsCol = codeReviewsCollection || db.collection("code_reviews");
+    const targetReviewsCol =
+      codeReviewsCollection || db.collection("code_reviews");
 
     const { reviewId, status, feedback, rubric } = req.body;
 
     if (!reviewId || !ObjectId.isValid(reviewId)) {
-      return res.status(400).json({ success: false, message: "Valid reviewId is required." });
+      return res
+        .status(400)
+        .json({ success: false, message: "Valid reviewId is required." });
     }
 
     const updateData = {
@@ -1160,11 +1635,13 @@ app.put("/api/mentor/reviews", async (req, res) => {
 
     const result = await targetReviewsCol.updateOne(
       { _id: new ObjectId(reviewId) },
-      { $set: updateData }
+      { $set: updateData },
     );
 
     if (result.matchedCount === 0) {
-      return res.status(404).json({ success: false, message: "Review submission not found." });
+      return res
+        .status(404)
+        .json({ success: false, message: "Review submission not found." });
     }
 
     res.json({
@@ -1174,17 +1651,20 @@ app.put("/api/mentor/reviews", async (req, res) => {
     });
   } catch (err) {
     console.error("Failed to update review:", err);
-    res.status(500).json({ success: false, message: "Failed to save review feedback." });
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to save review feedback." });
   }
 });
-
 
 /* ========================================================
    MENTOR SESSIONS API
 ======================================================== */
 
 const normalizeEmail = (value) =>
-  String(value || "").trim().toLowerCase();
+  String(value || "")
+    .trim()
+    .toLowerCase();
 
 const allowedSessionStatuses = [
   "pending",
@@ -1193,11 +1673,7 @@ const allowedSessionStatuses = [
   "cancelled",
 ];
 
-const allowedActionStatuses = [
-  "todo",
-  "in-progress",
-  "completed",
-];
+const allowedActionStatuses = ["todo", "in-progress", "completed"];
 
 const isValidDate = (value) =>
   value && !Number.isNaN(new Date(value).getTime());
@@ -1209,7 +1685,7 @@ async function getMentorByEmail(email) {
   });
 }
 
-// GET mentor availability
+// 22.GET mentor availability
 app.get("/api/mentor/sessions/availability", async (req, res) => {
   try {
     const mentorEmail = normalizeEmail(req.query.mentorEmail);
@@ -1228,8 +1704,9 @@ app.get("/api/mentor/sessions/availability", async (req, res) => {
       });
     }
 
-    const availability =
-      await mentorAvailabilityCollection.findOne({ mentorEmail });
+    const availability = await mentorAvailabilityCollection.findOne({
+      mentorEmail,
+    });
 
     res.json({
       availability: availability || {
@@ -1248,7 +1725,7 @@ app.get("/api/mentor/sessions/availability", async (req, res) => {
   }
 });
 
-// CREATE OR UPDATE mentor availability
+//23. CREATE OR UPDATE mentor availability
 app.put("/api/mentor/sessions/availability", async (req, res) => {
   try {
     const mentorEmail = normalizeEmail(req.body.mentorEmail);
@@ -1277,10 +1754,7 @@ app.put("/api/mentor/sessions/availability", async (req, res) => {
       });
     }
 
-    if (
-      !Array.isArray(weeklySchedule) ||
-      !Array.isArray(blockedDates)
-    ) {
+    if (!Array.isArray(weeklySchedule) || !Array.isArray(blockedDates)) {
       return res.status(400).json({
         message: "Schedule and blocked dates must be arrays.",
       });
@@ -1305,7 +1779,7 @@ app.put("/api/mentor/sessions/availability", async (req, res) => {
         Number(slot.startTime.slice(0, 2)) < 24 &&
         Number(slot.startTime.slice(3, 5)) < 60 &&
         Number(slot.endTime.slice(0, 2)) < 24 &&
-        Number(slot.endTime.slice(3, 5)) < 60
+        Number(slot.endTime.slice(3, 5)) < 60,
     );
 
     if (!validSchedule) {
@@ -1319,8 +1793,9 @@ app.put("/api/mentor/sessions/availability", async (req, res) => {
       timezone: String(timezone || "Asia/Dhaka"),
       durationMinutes: duration,
       weeklySchedule,
-      blockedDates: blockedDates
-        .filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date)),
+      blockedDates: blockedDates.filter((date) =>
+        /^\d{4}-\d{2}-\d{2}$/.test(date),
+      ),
       updatedAt: new Date(),
     };
 
@@ -1330,7 +1805,7 @@ app.put("/api/mentor/sessions/availability", async (req, res) => {
         $set: document,
         $setOnInsert: { createdAt: new Date() },
       },
-      { upsert: true }
+      { upsert: true },
     );
 
     res.json({
@@ -1346,7 +1821,7 @@ app.put("/api/mentor/sessions/availability", async (req, res) => {
   }
 });
 
-// GET mentor's sessions
+//24. GET mentor's sessions
 app.get("/api/mentor/sessions", async (req, res) => {
   try {
     const mentorEmail = normalizeEmail(req.query.mentorEmail);
@@ -1387,19 +1862,13 @@ app.get("/api/mentor/sessions", async (req, res) => {
   }
 });
 
-// CREATE a session
+//25. CREATE a session
 app.post("/api/mentor/sessions", async (req, res) => {
   try {
     const mentorEmail = normalizeEmail(req.body.mentorEmail);
     const menteeEmail = normalizeEmail(req.body.menteeEmail);
 
-    const {
-      title,
-      description,
-      startAt,
-      endAt,
-      meetingLink,
-    } = req.body;
+    const { title, description, startAt, endAt, meetingLink } = req.body;
 
     if (
       !mentorEmail ||
@@ -1461,10 +1930,14 @@ app.post("/api/mentor/sessions", async (req, res) => {
       menteeEmail,
       menteeName: mentee.name || menteeEmail,
       title: String(title).trim().slice(0, 150),
-      description: String(description || "").trim().slice(0, 2000),
+      description: String(description || "")
+        .trim()
+        .slice(0, 2000),
       startAt: start,
       endAt: end,
-      meetingLink: String(meetingLink || "").trim().slice(0, 1000),
+      meetingLink: String(meetingLink || "")
+        .trim()
+        .slice(0, 1000),
       status: "pending",
       notes: "",
       actionItems: [],
@@ -1487,7 +1960,7 @@ app.post("/api/mentor/sessions", async (req, res) => {
   }
 });
 
-// UPDATE session status, meeting link, notes, or action items
+//26 UPDATE session status, meeting link, notes, or action items
 app.patch("/api/mentor/sessions/:id", async (req, res) => {
   try {
     const mentorEmail = normalizeEmail(req.body.mentorEmail);
@@ -1531,9 +2004,7 @@ app.patch("/api/mentor/sessions/:id", async (req, res) => {
     }
 
     if (req.body.meetingLink !== undefined) {
-      updates.meetingLink = String(req.body.meetingLink)
-        .trim()
-        .slice(0, 1000);
+      updates.meetingLink = String(req.body.meetingLink).trim().slice(0, 1000);
     }
 
     if (req.body.notes !== undefined) {
@@ -1555,8 +2026,7 @@ app.patch("/api/mentor/sessions/:id", async (req, res) => {
 
       const validItems = req.body.actionItems.every((item) => {
         const dueDateValid =
-          !item.dueDate ||
-          /^\d{4}-\d{2}-\d{2}$/.test(item.dueDate);
+          !item.dueDate || /^\d{4}-\d{2}-\d{2}$/.test(item.dueDate);
 
         return (
           String(item.title || "").trim().length > 0 &&
@@ -1585,7 +2055,7 @@ app.patch("/api/mentor/sessions/:id", async (req, res) => {
 
     await mentorSessionsCollection.updateOne(
       { _id: session._id, mentorEmail },
-      { $set: updates }
+      { $set: updates },
     );
 
     const updatedSession = await mentorSessionsCollection.findOne({
@@ -1605,10 +2075,6 @@ app.patch("/api/mentor/sessions/:id", async (req, res) => {
     });
   }
 });
-
-
-
-
 
 // Call this only when application terminates
 export async function disconnectFromMongoDB() {
