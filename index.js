@@ -37,6 +37,7 @@ let quizzesCollection;
 let challengesCollection;
 let quizSessionsCollection;
 let challengeProgressCollection;
+let mentorRequestsCollection;
 
 export async function connectToMongoDB() {
   try {
@@ -79,6 +80,21 @@ export async function connectToMongoDB() {
     console.log(
       `Assessments using "${quizzesCollection.collectionName}" and "${challengesCollection.collectionName}"`,
     );
+    // mentor request
+    mentorRequestsCollection = db.collection("mentor_requests");
+
+    // One pending request per developer and mentor.
+    await mentorRequestsCollection.createIndex(
+      { mentorEmail: 1, menteeEmail: 1 },
+      { unique: true },
+    );
+
+    // Fast lookups for each mentor's requests.
+    await mentorRequestsCollection.createIndex({
+      mentorEmail: 1,
+      status: 1,
+      createdAt: -1,
+    });
 
     console.log("Successfully connected to MongoDB!");
     return client;
@@ -589,8 +605,14 @@ const CHALLENGE_WEIGHT = 0.3;
 const DEFAULT_PASS_MARK = 70;
 const SUBMIT_GRACE_SECONDS = 30; // network delay allowance on timed quizzes
 
-const cleanEmail = (value) => String(value || "").trim().toLowerCase();
-const cleanSlug = (value) => String(value || "").trim().toLowerCase();
+const cleanEmail = (value) =>
+  String(value || "")
+    .trim()
+    .toLowerCase();
+const cleanSlug = (value) =>
+  String(value || "")
+    .trim()
+    .toLowerCase();
 
 // Quiz questions may store the answer under any of these names.
 function correctIndexOf(question) {
@@ -684,9 +706,7 @@ async function computeBadge(email, courseSlug, quizHistory) {
     quizBest,
     challengePct,
     tiers: BADGE_TIERS,
-    nextTier: next
-      ? { name: next.name, pointsNeeded: next.min - score }
-      : null,
+    nextTier: next ? { name: next.name, pointsNeeded: next.min - score } : null,
   };
 }
 
@@ -794,7 +814,9 @@ app.post("/api/assessments/quiz/start", async (req, res) => {
     }
 
     const quizDoc = await quizzesCollection.findOne({ courseSlug });
-    const questions = Array.isArray(quizDoc?.questions) ? quizDoc.questions : [];
+    const questions = Array.isArray(quizDoc?.questions)
+      ? quizDoc.questions
+      : [];
 
     if (!quizDoc || questions.length === 0) {
       return res.status(404).json({
@@ -975,7 +997,6 @@ app.post("/api/assessments/quiz/submit", async (req, res) => {
   }
 });
 
-
 //15. GET /api/assessments/challenges/:id
 app.get("/api/assessments/challenges/:id", async (req, res) => {
   try {
@@ -1034,7 +1055,6 @@ app.get("/api/assessments/challenges/:id", async (req, res) => {
       .json({ success: false, message: "Could not load this challenge." });
   }
 });
-
 
 // 16.POST /api/assessments/challenges/:id/submit   { email, passedTests, code }
 app.post("/api/assessments/challenges/:id/submit", async (req, res) => {
@@ -1109,7 +1129,6 @@ app.post("/api/assessments/challenges/:id/submit", async (req, res) => {
   }
 });
 
-
 //17. GET developer mentorship dashboard data
 app.get("/api/developer/mentorship", async (req, res) => {
   try {
@@ -1127,8 +1146,7 @@ app.get("/api/developer/mentorship", async (req, res) => {
     const db = client.db(process.env.DB_NAME || "skillgraph");
 
     const users = userCollection || db.collection("user");
-    const reviews =
-      codeReviewsCollection || db.collection("code_reviews");
+    const reviews = codeReviewsCollection || db.collection("code_reviews");
     const sessions =
       mentorSessionsCollection || db.collection("mentor_sessions");
 
@@ -1142,11 +1160,7 @@ app.get("/api/developer/mentorship", async (req, res) => {
     }
 
     const [reviewData, sessionData] = await Promise.all([
-      reviews
-        .find({ email })
-        .sort({ createdAt: -1 })
-        .limit(50)
-        .toArray(),
+      reviews.find({ email }).sort({ createdAt: -1 }).limit(50).toArray(),
 
       sessions
         .find({ menteeEmail: email })
@@ -1156,10 +1170,10 @@ app.get("/api/developer/mentorship", async (req, res) => {
     ]);
 
     const mentorEmail = String(
-      developer.assignedMentorEmail ||
-      developer.mentorEmail ||
-      ""
-    ).trim().toLowerCase();
+      developer.assignedMentorEmail || developer.mentorEmail || "",
+    )
+      .trim()
+      .toLowerCase();
 
     const mentor = mentorEmail
       ? await users.findOne({
@@ -1175,8 +1189,14 @@ app.get("/api/developer/mentorship", async (req, res) => {
           ? {
               name: mentor.name || "Mentor",
               email: mentor.email,
-              expertise: mentor.expertise || "Software Development Mentor",
+              expertise:
+                mentor.expertise ||
+                mentor.targetCareer ||
+                "Software Development Mentor",
+              title: mentor.title || "Software Development Mentor",
               avatar: mentor.image || mentor.avatar || "",
+              rating: mentor.rating ?? null,
+              bio: mentor.bio || "",
             }
           : null,
 
@@ -1685,6 +1705,541 @@ async function getMentorByEmail(email) {
   });
 }
 
+/* ========================================================
+   SKILLGRAPH MENTORSHIP WORKFLOW
+======================================================== */
+
+const mentorCapacityOptions = [15, 20];
+
+const mentorshipResponse = (res, status, message, extra = {}) =>
+  res.status(status).json({
+    success: status < 400,
+    message,
+    ...extra,
+  });
+
+// GET: public mentor marketplace
+app.get("/api/mentorship/mentors", async (req, res) => {
+  try {
+    const mentors = await userCollection
+      .find({ role: "mentor" })
+      .project({
+        name: 1,
+        email: 1,
+        image: 1,
+        avatar: 1,
+        expertise: 1,
+        bio: 1,
+        title: 1,
+        targetCareer: 1,
+        menteeCapacity: 1,
+        activeMenteeCount: 1,
+      })
+      .sort({ name: 1 })
+      .toArray();
+
+    const data = await Promise.all(
+      mentors.map(async (mentor) => {
+        const email = normalizeEmail(mentor.email);
+        const capacity = mentorCapacityOptions.includes(
+          Number(mentor.menteeCapacity),
+        )
+          ? Number(mentor.menteeCapacity)
+          : 15;
+
+        // Count approved requests as the displayed source of truth.
+        const activeMentees = await mentorRequestsCollection.countDocuments({
+          mentorEmail: email,
+          status: "approved",
+        });
+
+        return {
+          id: String(mentor._id),
+          name: mentor.name || email.split("@")[0],
+          email,
+          image: mentor.image || mentor.avatar || "",
+          expertise:
+            mentor.expertise || mentor.targetCareer || "Software Development",
+          bio: mentor.bio || "",
+          title: mentor.title || "Software Development Mentor",
+          capacity,
+          activeMentees,
+          availableSlots: Math.max(0, capacity - activeMentees),
+          isAvailable: activeMentees < capacity,
+        };
+      }),
+    );
+
+    return res.json({ success: true, data });
+  } catch (error) {
+    console.error("Load mentor marketplace:", error);
+    return mentorshipResponse(res, 500, "Failed to load mentor marketplace.");
+  }
+});
+
+// GET: mentorship requests for a developer or mentor
+app.get("/api/mentorship/requests", async (req, res) => {
+  try {
+    const mentorEmail = normalizeEmail(req.query.mentorEmail);
+    const menteeEmail = normalizeEmail(req.query.menteeEmail);
+
+    if (!mentorEmail && !menteeEmail) {
+      return mentorshipResponse(
+        res,
+        400,
+        "Provide mentorEmail or menteeEmail.",
+      );
+    }
+
+    const query = mentorEmail ? { mentorEmail } : { menteeEmail };
+
+    const requests = await mentorRequestsCollection
+      .find(query)
+      .sort({ createdAt: -1 })
+      .limit(200)
+      .toArray();
+
+    return res.json({
+      success: true,
+      data: requests.map((request) => ({
+        ...request,
+        id: String(request._id),
+        _id: String(request._id),
+      })),
+    });
+  } catch (error) {
+    console.error("Load mentorship requests:", error);
+    return mentorshipResponse(res, 500, "Failed to load requests.");
+  }
+});
+
+// POST: developer requests a mentor
+app.post("/api/mentorship/requests", async (req, res) => {
+  try {
+    const menteeEmail = normalizeEmail(req.body.menteeEmail);
+    const mentorEmail = normalizeEmail(req.body.mentorEmail);
+    const message = String(req.body.message || "")
+      .trim()
+      .slice(0, 1500);
+
+    if (!menteeEmail || !mentorEmail) {
+      return mentorshipResponse(
+        res,
+        400,
+        "Developer and mentor email are required.",
+      );
+    }
+
+    const [mentee, mentor] = await Promise.all([
+      userCollection.findOne({
+        email: menteeEmail,
+        role: "developer",
+      }),
+      getMentorByEmail(mentorEmail),
+    ]);
+
+    if (!mentee) {
+      return mentorshipResponse(res, 404, "Developer account not found.");
+    }
+
+    if (!mentor) {
+      return mentorshipResponse(res, 404, "Mentor account not found.");
+    }
+
+    if (
+      normalizeEmail(mentee.assignedMentorEmail || mentee.mentorEmail) ===
+      mentorEmail
+    ) {
+      return mentorshipResponse(res, 409, "You already have this mentor.");
+    }
+
+    const capacity = mentorCapacityOptions.includes(
+      Number(mentor.menteeCapacity),
+    )
+      ? Number(mentor.menteeCapacity)
+      : 15;
+
+    const activeCount = await mentorRequestsCollection.countDocuments({
+      mentorEmail,
+      status: "approved",
+    });
+
+    if (activeCount >= capacity) {
+      return mentorshipResponse(
+        res,
+        409,
+        "This mentor has no available slots.",
+      );
+    }
+
+    const existing = await mentorRequestsCollection.findOne({
+      mentorEmail,
+      menteeEmail,
+    });
+
+    if (existing) {
+      if (existing.status === "pending") {
+        return mentorshipResponse(res, 409, "Your request is already pending.");
+      }
+
+      if (existing.status === "approved") {
+        return mentorshipResponse(
+          res,
+          409,
+          "Your mentorship is already approved.",
+        );
+      }
+
+      return mentorshipResponse(
+        res,
+        409,
+        "A request already exists for this mentor. Please contact them if you need to try again.",
+      );
+    }
+
+    const request = {
+      mentorEmail,
+      menteeEmail,
+      menteeName: mentee.name || menteeEmail.split("@")[0],
+      mentorName: mentor.name || mentorEmail.split("@")[0],
+      message,
+      status: "pending",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await mentorRequestsCollection.insertOne(request);
+
+    return res.status(201).json({
+      success: true,
+      message: "Mentorship request sent successfully.",
+      data: { ...request, id: String(result.insertedId) },
+    });
+  } catch (error) {
+    // Protect against a duplicate request if two requests arrive together.
+    if (error.code === 11000) {
+      return mentorshipResponse(res, 409, "A request already exists.");
+    }
+
+    console.error("Create mentorship request:", error);
+    return mentorshipResponse(res, 500, "Could not send mentorship request.");
+  }
+});
+
+// PATCH: Mentor approves or rejects a mentorship request
+app.patch("/api/mentorship/requests/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, mentorEmail } = req.body;
+
+    // Validate request ID
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid mentorship request ID.",
+      });
+    }
+
+    // Validate status
+    if (!["approved", "rejected"].includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: "Status must be approved or rejected.",
+      });
+    }
+
+    if (!mentorEmail) {
+      return res.status(400).json({
+        success: false,
+        message: "Mentor email is required.",
+      });
+    }
+
+    // Find mentorship request
+    const request = await mentorRequestsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!request) {
+      return res.status(404).json({
+        success: false,
+        message: "Mentorship request not found.",
+      });
+    }
+
+    // Ensure the request belongs to this mentor
+    if (request.mentorEmail?.toLowerCase() !== mentorEmail.toLowerCase()) {
+      return res.status(403).json({
+        success: false,
+        message: "You are not authorized to manage this request.",
+      });
+    }
+
+    // Ensure the request is still pending
+    if (request.status !== "pending") {
+      return res.status(409).json({
+        success: false,
+        message: `This request has already been ${request.status}.`,
+      });
+    }
+
+    // Find mentor
+    const mentor = await userCollection.findOne({
+      email: {
+        $regex: `^${mentorEmail.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
+        $options: "i",
+      },
+      role: "mentor",
+    });
+
+    if (!mentor) {
+      return res.status(404).json({
+        success: false,
+        message: "Mentor not found.",
+      });
+    }
+
+    // Reject request
+    if (status === "rejected") {
+      const rejection = await mentorRequestsCollection.updateOne(
+        {
+          _id: request._id,
+          status: "pending",
+        },
+        {
+          $set: {
+            status: "rejected",
+            updatedAt: new Date(),
+          },
+        },
+      );
+
+      if (rejection.modifiedCount !== 1) {
+        return res.status(409).json({
+          success: false,
+          message: "This request has already been processed.",
+        });
+      }
+
+      return res.json({
+        success: true,
+        message: "Mentorship request rejected successfully.",
+      });
+    }
+
+    // Get allowed mentor capacity
+    const capacity = mentorCapacityOptions.includes(
+      Number(mentor.menteeCapacity),
+    )
+      ? Number(mentor.menteeCapacity)
+      : 15;
+
+    // Count currently approved requests
+    const approvedCount = await mentorRequestsCollection.countDocuments({
+      mentorEmail: request.mentorEmail,
+      status: "approved",
+    });
+
+    // Initialize missing counters for older mentor records
+    await userCollection.updateOne(
+      {
+        _id: mentor._id,
+        activeMenteeCount: { $exists: false },
+      },
+      {
+        $set: {
+          activeMenteeCount: approvedCount,
+          menteeCapacity: capacity,
+        },
+      },
+    );
+
+    // Read the latest mentor record
+    const refreshedMentor = await userCollection.findOne({
+      _id: mentor._id,
+      role: "mentor",
+    });
+
+    if (!refreshedMentor) {
+      return res.status(404).json({
+        success: false,
+        message: "Mentor not found.",
+      });
+    }
+
+    const effectiveCapacity = mentorCapacityOptions.includes(
+      Number(refreshedMentor.menteeCapacity),
+    )
+      ? Number(refreshedMentor.menteeCapacity)
+      : capacity;
+
+    // Check capacity
+    if (approvedCount >= effectiveCapacity) {
+      return res.status(409).json({
+        success: false,
+        message: `Mentor capacity is full (${effectiveCapacity} mentees).`,
+      });
+    }
+
+    // Atomically reserve one mentor slot
+    const capacityUpdate = await userCollection.updateOne(
+      {
+        _id: refreshedMentor._id,
+        role: "mentor",
+        $expr: {
+          $lt: [
+            { $ifNull: ["$activeMenteeCount", 0] },
+            { $ifNull: ["$menteeCapacity", 15] },
+          ],
+        },
+      },
+      {
+        $inc: {
+          activeMenteeCount: 1,
+        },
+        $set: {
+          updatedAt: new Date(),
+        },
+      },
+    );
+
+    if (capacityUpdate.modifiedCount !== 1) {
+      return res.status(409).json({
+        success: false,
+        message: "Mentor capacity is full. Please refresh and try again.",
+      });
+    }
+
+    // Approve only if the request is still pending
+    const approval = await mentorRequestsCollection.updateOne(
+      {
+        _id: request._id,
+        status: "pending",
+      },
+      {
+        $set: {
+          status: "approved",
+          updatedAt: new Date(),
+        },
+      },
+    );
+
+    // If approval failed, release the reserved slot
+    if (approval.modifiedCount !== 1) {
+      await userCollection.updateOne(
+        {
+          _id: refreshedMentor._id,
+          activeMenteeCount: { $gt: 0 },
+        },
+        {
+          $inc: {
+            activeMenteeCount: -1,
+          },
+          $set: {
+            updatedAt: new Date(),
+          },
+        },
+      );
+
+      return res.status(409).json({
+        success: false,
+        message: "This request has already been processed.",
+      });
+    }
+
+    // Assign the approved mentor to the developer
+    const menteeEmail = normalizeEmail(
+      request.menteeEmail || request.studentEmail,
+    );
+
+    if (menteeEmail) {
+      await userCollection.updateOne(
+        { email: menteeEmail },
+        {
+          $set: {
+            mentorEmail: normalizeEmail(refreshedMentor.email),
+            assignedMentorEmail: normalizeEmail(refreshedMentor.email),
+            updatedAt: new Date(),
+          },
+        },
+      );
+    }
+    return res.json({
+      success: true,
+      message: "Mentorship request approved successfully.",
+      data: {
+        requestId: request._id,
+        status: "approved",
+        mentorEmail: refreshedMentor.email,
+        activeMenteeCount: Number(refreshedMentor.activeMenteeCount ?? 0) + 1,
+        menteeCapacity: effectiveCapacity,
+      },
+    });
+  } catch (error) {
+    console.error("Mentorship request update error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update mentorship request.",
+    });
+  }
+});
+
+// PUT: mentor sets their own capacity to 15 or 20
+app.put("/api/mentorship/capacity", async (req, res) => {
+  try {
+    const mentorEmail = normalizeEmail(req.body.mentorEmail);
+    const capacity = Number(req.body.capacity);
+
+    if (!mentorEmail || !mentorCapacityOptions.includes(capacity)) {
+      return mentorshipResponse(
+        res,
+        400,
+        "Provide mentorEmail and a capacity of 15 or 20.",
+      );
+    }
+
+    const mentor = await getMentorByEmail(mentorEmail);
+
+    if (!mentor) {
+      return mentorshipResponse(res, 403, "Mentor account not found.");
+    }
+
+    const activeCount = await mentorRequestsCollection.countDocuments({
+      mentorEmail,
+      status: "approved",
+    });
+
+    if (capacity < activeCount) {
+      return mentorshipResponse(
+        res,
+        409,
+        `Capacity cannot be below your ${activeCount} current mentees.`,
+      );
+    }
+
+    await userCollection.updateOne(
+      { _id: mentor._id },
+      {
+        $set: {
+          menteeCapacity: capacity,
+          activeMenteeCount: activeCount,
+          updatedAt: new Date(),
+        },
+      },
+    );
+
+    return res.json({
+      success: true,
+      message: `Mentee capacity set to ${capacity}.`,
+      data: { capacity, activeMentees: activeCount },
+    });
+  } catch (error) {
+    console.error("Update mentor capacity:", error);
+    return mentorshipResponse(res, 500, "Could not update capacity.");
+  }
+});
+
 // 22.GET mentor availability
 app.get("/api/mentor/sessions/availability", async (req, res) => {
   try {
@@ -1895,7 +2450,6 @@ app.post("/api/mentor/sessions", async (req, res) => {
       getMentorByEmail(mentorEmail),
       userCollection.findOne({
         email: menteeEmail,
-        role: "developer",
       }),
     ]);
 
@@ -1906,10 +2460,19 @@ app.post("/api/mentor/sessions", async (req, res) => {
     }
 
     if (!mentee) {
+      console.log("Mentee email searched:", menteeEmail);
+
       return res.status(404).json({
-        message: "Developer/mentee account not found.",
+        message:
+          "No user found with this email. Check the email field and registered account.",
       });
     }
+
+    console.log("Matched mentee account:", {
+      email: mentee.email,
+      role: mentee.role,
+      name: mentee.name,
+    });
 
     // Prevent overlapping sessions for this mentor.
     const overlap = await mentorSessionsCollection.findOne({
@@ -2076,6 +2639,31 @@ app.patch("/api/mentor/sessions/:id", async (req, res) => {
   }
 });
 
+app.get("/api/developer/sessions", async (req, res) => {
+  try {
+    const menteeEmail = normalizeEmail(req.query.menteeEmail);
+
+    if (!menteeEmail) {
+      return res.status(400).json({
+        message: "Developer email is required.",
+      });
+    }
+
+    const sessions = await mentorSessionsCollection
+      .find({ menteeEmail })
+      .sort({ startAt: 1 })
+      .limit(200)
+      .toArray();
+
+    return res.status(200).json({ sessions });
+  } catch (error) {
+    console.error("Get developer sessions:", error);
+
+    return res.status(500).json({
+      message: "Failed to load developer sessions.",
+    });
+  }
+});
 // Call this only when application terminates
 export async function disconnectFromMongoDB() {
   await client.close();
