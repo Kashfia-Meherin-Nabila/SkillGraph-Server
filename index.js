@@ -243,12 +243,19 @@ app.delete("/api/courses/:id", async (req, res) => {
 /* ========================================================
    MODULES & PROGRESS APIS (Pure DB queries)
 ======================================================== */
-// 6. GET MODULES FOR A COURSE
+// 6. GET MODULES FOR A COURSE (Only Approved & Default Modules for Developers)
 app.get("/api/courses/:slug/modules", async (req, res) => {
   try {
     const { slug } = req.params;
     const modules = await modulesCollection
-      .find({ courseSlug: slug.toLowerCase() })
+      .find({
+        courseSlug: slug.toLowerCase(),
+        $or: [
+          { status: "approved" },
+          { status: { $exists: false } },
+          { status: null },
+        ],
+      })
       .sort({ moduleId: 1 })
       .toArray();
     res.json(modules);
@@ -256,6 +263,8 @@ app.get("/api/courses/:slug/modules", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch modules" });
   }
 });
+
+
 // 7. GET USER PROGRESS (Starts at 0 completed tasks)
 app.get("/api/progress/:email/:courseSlug", async (req, res) => {
   try {
@@ -506,9 +515,16 @@ app.get("/api/roadmap", async (req, res) => {
       .sort({ priority: 1, name: 1 })
       .toArray();
 
-    // Fetch the existing modules for this career.
+        // Fetch approved modules for this career
     const modules = await modulesCollection
-      .find({ courseSlug })
+      .find({
+        courseSlug,
+        $or: [
+          { status: "approved" },
+          { status: { $exists: false } },
+          { status: null },
+        ],
+      })
       .sort({ moduleId: 1 })
       .toArray();
 
@@ -1709,14 +1725,17 @@ async function getMentorByEmail(email) {
    SKILLGRAPH MENTORSHIP WORKFLOW
 ======================================================== */
 
-const mentorCapacityOptions = [15, 20];
+// const mentorCapacityOptions = [15, 20];
 
-const mentorshipResponse = (res, status, message, extra = {}) =>
-  res.status(status).json({
-    success: status < 400,
-    message,
-    ...extra,
-  });
+// const mentorshipResponse = (res, status, message, extra = {}) =>
+//   res.status(status).json({
+//     success: status < 400,
+//     message,
+//     ...extra,
+//   });
+
+
+const mentorCapacityOptions = [15, 20];
 
 // GET: public mentor marketplace
 app.get("/api/mentorship/mentors", async (req, res) => {
@@ -1741,17 +1760,39 @@ app.get("/api/mentorship/mentors", async (req, res) => {
     const data = await Promise.all(
       mentors.map(async (mentor) => {
         const email = normalizeEmail(mentor.email);
+
         const capacity = mentorCapacityOptions.includes(
-          Number(mentor.menteeCapacity),
+          Number(mentor.menteeCapacity)
         )
           ? Number(mentor.menteeCapacity)
           : 15;
 
-        // Count approved requests as the displayed source of truth.
-        const activeMentees = await mentorRequestsCollection.countDocuments({
-          mentorEmail: email,
-          status: "approved",
+        // Get all approved mentees for this mentor.
+        const approvedRequests = await mentorRequestsCollection
+          .find({
+            mentorEmail: email,
+            status: "approved",
+          })
+          .project({
+            menteeName: 1,
+            menteeEmail: 1,
+            studentEmail: 1,
+          })
+          .toArray();
+
+        const approvedMentees = approvedRequests.map((request) => {
+          const menteeEmail = normalizeEmail(
+            request.menteeEmail || request.studentEmail
+          );
+
+          return {
+            name: request.menteeName || menteeEmail.split("@")[0],
+            email: menteeEmail,
+          };
         });
+
+        // Approved requests are the source of truth for the displayed count.
+        const activeMentees = approvedMentees.length;
 
         return {
           id: String(mentor._id),
@@ -1759,23 +1800,35 @@ app.get("/api/mentorship/mentors", async (req, res) => {
           email,
           image: mentor.image || mentor.avatar || "",
           expertise:
-            mentor.expertise || mentor.targetCareer || "Software Development",
+            mentor.expertise ||
+            mentor.targetCareer ||
+            "Software Development",
           bio: mentor.bio || "",
           title: mentor.title || "Software Development Mentor",
           capacity,
           activeMentees,
           availableSlots: Math.max(0, capacity - activeMentees),
           isAvailable: activeMentees < capacity,
+          approvedMentees,
         };
-      }),
+      })
     );
 
-    return res.json({ success: true, data });
+    return res.json({
+      success: true,
+      data,
+    });
   } catch (error) {
     console.error("Load mentor marketplace:", error);
-    return mentorshipResponse(res, 500, "Failed to load mentor marketplace.");
+
+    return mentorshipResponse(
+      res,
+      500,
+      "Failed to load mentor marketplace."
+    );
   }
 });
+
 
 // GET: mentorship requests for a developer or mentor
 app.get("/api/mentorship/requests", async (req, res) => {
@@ -2417,13 +2470,15 @@ app.get("/api/mentor/sessions", async (req, res) => {
   }
 });
 
+
 //25. CREATE a session
+
+// 25. CREATE A LIVE CONCEPTUAL / 1-ON-1 SESSION
 app.post("/api/mentor/sessions", async (req, res) => {
   try {
     const mentorEmail = normalizeEmail(req.body.mentorEmail);
-    const menteeEmail = normalizeEmail(req.body.menteeEmail);
-
-    const { title, description, startAt, endAt, meetingLink } = req.body;
+    let menteeEmail = normalizeEmail(req.body.menteeEmail);
+    const { title, description, startAt, endAt, meetingLink, forAllMentees } = req.body;
 
     if (
       !mentorEmail ||
@@ -2433,7 +2488,14 @@ app.post("/api/mentor/sessions", async (req, res) => {
       !isValidDate(endAt)
     ) {
       return res.status(400).json({
-        message: "Provide a mentee, topic, start time, and end time.",
+        message: "Provide session title, mentee/audience, start time, and end time.",
+      });
+    }
+
+    // Prevent mentor from scheduling a session with themselves
+    if (menteeEmail === mentorEmail) {
+      return res.status(400).json({
+        message: "You cannot schedule a session with yourself. Select an active mentee or choose 'All Mentees'.",
       });
     }
 
@@ -2446,35 +2508,30 @@ app.post("/api/mentor/sessions", async (req, res) => {
       });
     }
 
-    const [mentor, mentee] = await Promise.all([
-      getMentorByEmail(mentorEmail),
-      userCollection.findOne({
-        email: menteeEmail,
-      }),
-    ]);
-
+    const mentor = await getMentorByEmail(mentorEmail);
     if (!mentor) {
       return res.status(403).json({
         message: "Only mentors can create sessions.",
       });
     }
 
-    if (!mentee) {
-      console.log("Mentee email searched:", menteeEmail);
+    let menteeName = "Developer";
+    const isBroadcast = Boolean(forAllMentees) || menteeEmail === "all";
 
-      return res.status(404).json({
-        message:
-          "No user found with this email. Check the email field and registered account.",
-      });
+    if (isBroadcast) {
+      menteeEmail = "all";
+      menteeName = "All Mentees (Conceptual Session)";
+    } else {
+      const mentee = await userCollection.findOne({ email: menteeEmail });
+      if (!mentee) {
+        return res.status(404).json({
+          message: `Developer account not found for email: ${menteeEmail}`,
+        });
+      }
+      menteeName = mentee.name || menteeEmail.split("@")[0];
     }
 
-    console.log("Matched mentee account:", {
-      email: mentee.email,
-      role: mentee.role,
-      name: mentee.name,
-    });
-
-    // Prevent overlapping sessions for this mentor.
+    // Prevent overlapping sessions for this mentor
     const overlap = await mentorSessionsCollection.findOne({
       mentorEmail,
       status: { $in: ["pending", "confirmed"] },
@@ -2484,24 +2541,22 @@ app.post("/api/mentor/sessions", async (req, res) => {
 
     if (overlap) {
       return res.status(409).json({
-        message: "This time overlaps another scheduled session.",
+        message: "This time overlaps with another scheduled session.",
       });
     }
 
     const session = {
       mentorEmail,
+      mentorName: mentor.name || mentorEmail.split("@")[0],
       menteeEmail,
-      menteeName: mentee.name || menteeEmail,
+      menteeName,
+      forAllMentees: isBroadcast,
       title: String(title).trim().slice(0, 150),
-      description: String(description || "")
-        .trim()
-        .slice(0, 2000),
+      description: String(description || "").trim().slice(0, 2000),
       startAt: start,
       endAt: end,
-      meetingLink: String(meetingLink || "")
-        .trim()
-        .slice(0, 1000),
-      status: "pending",
+      meetingLink: String(meetingLink || "").trim().slice(0, 1000),
+      status: "confirmed", // Created by mentor, ready to join
       notes: "",
       actionItems: [],
       createdAt: new Date(),
@@ -2512,11 +2567,11 @@ app.post("/api/mentor/sessions", async (req, res) => {
 
     res.status(201).json({
       success: true,
-      message: "Session created successfully.",
+      message: "Live conceptual session created successfully.",
       session: { ...session, _id: result.insertedId },
     });
   } catch (error) {
-    console.error("Create mentor session:", error);
+    console.error("Create mentor session error:", error);
     res.status(500).json({
       message: "Failed to create session.",
     });
@@ -2649,8 +2704,32 @@ app.get("/api/developer/sessions", async (req, res) => {
       });
     }
 
+    const db = client.db(process.env.DB_NAME || "skillgraph");
+    const users = userCollection || db.collection("user");
+
+    // Check if this developer has an assigned mentor
+    const developer = await users.findOne({ email: menteeEmail });
+    const mentorEmail = normalizeEmail(
+      developer?.assignedMentorEmail || developer?.mentorEmail || ""
+    );
+
+    // Matches:
+    // 1. Direct 1-on-1 sessions specifically for this developer
+    // 2. Broadcast conceptual sessions created by their mentor
+    const query = {
+      $or: [
+        { menteeEmail },
+        ...(mentorEmail
+          ? [
+              { mentorEmail, menteeEmail: "all" },
+              { mentorEmail, forAllMentees: true },
+            ]
+          : []),
+      ],
+    };
+
     const sessions = await mentorSessionsCollection
-      .find({ menteeEmail })
+      .find(query)
       .sort({ startAt: 1 })
       .limit(200)
       .toArray();
@@ -2658,12 +2737,178 @@ app.get("/api/developer/sessions", async (req, res) => {
     return res.status(200).json({ sessions });
   } catch (error) {
     console.error("Get developer sessions:", error);
-
     return res.status(500).json({
       message: "Failed to load developer sessions.",
     });
   }
 });
+/* ========================================================
+   MENTOR MODULE MANAGEMENT APIS
+======================================================== */
+
+// CREATE A NEW MODULE (By Mentor)
+app.post("/api/mentor/modules", async (req, res) => {
+  try {
+    const { mentorEmail, courseSlug, title, moduleId, tasks, status } = req.body;
+
+    if (!mentorEmail || !courseSlug || !title) {
+      return res.status(400).json({
+        success: false,
+        message: "Mentor email, course slug, and module title are required.",
+      });
+    }
+
+    const cleanSlug = String(courseSlug).toLowerCase().trim();
+
+    // Determine the next moduleId if not explicitly provided
+    let finalModuleId = Number(moduleId);
+    if (!finalModuleId || Number.isNaN(finalModuleId)) {
+      const highestModule = await modulesCollection
+        .find({ courseSlug: cleanSlug })
+        .sort({ moduleId: -1 })
+        .limit(1)
+        .toArray();
+      finalModuleId = highestModule.length > 0 ? (highestModule[0].moduleId || 0) + 1 : 1;
+    }
+
+    // Format tasks array
+    const formattedTasks = Array.isArray(tasks)
+      ? tasks.map((task, index) => ({
+          id: task.id || `${cleanSlug}-m${finalModuleId}-t${index + 1}`,
+          title: String(task.title || `Task ${index + 1}`).trim(),
+          type: task.type || "Coding Task",
+          est: task.est || "30m",
+          ...(task.isQuiz ? { isQuiz: true } : {}),
+        }))
+      : [];
+
+    const newModule = {
+      courseSlug: cleanSlug,
+      moduleId: finalModuleId,
+      title: String(title).trim(),
+      tasks: formattedTasks,
+      mentorEmail: normalizeEmail(mentorEmail),
+      // Mentors create as 'pending' by default, or 'approved' if auto-approved
+      status: status === "approved" ? "approved" : "pending",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await modulesCollection.insertOne(newModule);
+
+    return res.status(201).json({
+      success: true,
+      message: "Module created successfully.",
+      data: { ...newModule, _id: result.insertedId },
+    });
+  } catch (error) {
+    console.error("Failed to create module:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to create module.",
+    });
+  }
+});
+
+// GET ALL MODULES FOR MENTOR (With approval status filter)
+app.get("/api/mentor/modules", async (req, res) => {
+  try {
+    const courseSlug = req.query.courseSlug ? String(req.query.courseSlug).toLowerCase().trim() : null;
+    const mentorEmail = req.query.mentorEmail ? normalizeEmail(req.query.mentorEmail) : null;
+
+    const query = {};
+    if (courseSlug) query.courseSlug = courseSlug;
+    if (mentorEmail) {
+      query.$or = [
+        { mentorEmail },
+        { mentorEmail: { $exists: false } }, // include default system modules
+      ];
+    }
+
+    const modules = await modulesCollection.find(query).sort({ courseSlug: 1, moduleId: 1 }).toArray();
+
+    // Default system modules without a status tag are treated as "approved"
+    const formatted = modules.map((m) => ({
+      ...m,
+      status: m.status || "approved",
+    }));
+
+    return res.status(200).json({
+      success: true,
+      count: formatted.length,
+      data: formatted,
+    });
+  } catch (error) {
+    console.error("Failed to fetch mentor modules:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to load modules.",
+    });
+  }
+});
+
+// APPROVE OR REJECT A MODULE
+app.patch("/api/mentor/modules/:id/status", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid module ID." });
+    }
+
+    if (!["approved", "pending", "rejected"].includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: "Status must be 'approved', 'pending', or 'rejected'.",
+      });
+    }
+
+    const result = await modulesCollection.findOneAndUpdate(
+      { _id: new ObjectId(id) },
+      { $set: { status, updatedAt: new Date() } },
+      { returnDocument: "after" }
+    );
+
+    const updated = result?.value !== undefined ? result.value : result;
+
+    if (!updated) {
+      return res.status(404).json({ success: false, message: "Module not found." });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Module has been ${status}. It will ${status === "approved" ? "now" : "no longer"} appear in developer dashboards.`,
+      data: updated,
+    });
+  } catch (error) {
+    console.error("Failed to update module status:", error);
+    return res.status(500).json({ success: false, message: "Failed to update module status." });
+  }
+});
+
+// DELETE MODULE (Mentor)
+app.delete("/api/mentor/modules/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid module ID." });
+    }
+
+    const result = await modulesCollection.deleteOne({ _id: new ObjectId(id) });
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ success: false, message: "Module not found." });
+    }
+
+    return res.status(200).json({ success: true, message: "Module deleted successfully." });
+  } catch (error) {
+    console.error("Failed to delete module:", error);
+    return res.status(500).json({ success: false, message: "Failed to delete module." });
+  }
+});
+
+
+
 // Call this only when application terminates
 export async function disconnectFromMongoDB() {
   await client.close();
