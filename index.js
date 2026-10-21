@@ -12,7 +12,8 @@ const port = process.env.PORT || 5000;
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
 // MongoDB Client
 const client = new MongoClient(process.env.MONGODB_URI, {
@@ -2471,8 +2472,6 @@ app.get("/api/mentor/sessions", async (req, res) => {
 });
 
 
-//25. CREATE a session
-
 // 25. CREATE A LIVE CONCEPTUAL / 1-ON-1 SESSION
 app.post("/api/mentor/sessions", async (req, res) => {
   try {
@@ -2908,6 +2907,357 @@ app.delete("/api/mentor/modules/:id", async (req, res) => {
 });
 
 
+/* ========================================================
+   ADMIN MANAGEMENT APIS
+======================================================== */
+
+// 1. ADMIN PLATFORM ANALYTICS
+app.get("/api/admin/analytics", async (req, res) => {
+  try {
+    const [
+      totalUsers,
+      developersCount,
+      mentorsCount,
+      adminsCount,
+      totalCourses,
+      totalModules,
+      pendingModulesCount,
+      totalReviews,
+      recentUsers,
+    ] = await Promise.all([
+      userCollection.countDocuments(),
+      userCollection.countDocuments({ role: "developer" }),
+      userCollection.countDocuments({ role: "mentor" }),
+      userCollection.countDocuments({ role: "admin" }),
+      coursesCollection.countDocuments(),
+      modulesCollection.countDocuments(),
+      modulesCollection.countDocuments({ status: "pending" }),
+      codeReviewsCollection.countDocuments(),
+      userCollection
+        .find()
+        .sort({ createdAt: -1 })
+        .limit(6)
+        .project({ password: 0 })
+        .toArray(),
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        totalUsers,
+        developersCount,
+        mentorsCount,
+        adminsCount,
+        totalCourses,
+        totalModules,
+        pendingModulesCount,
+        totalReviews,
+        recentUsers: recentUsers.map((u) => ({
+          id: String(u._id),
+          name: u.name || "User",
+          email: u.email,
+          role: u.role || "developer",
+          targetCareer: u.targetCareer || "N/A",
+          createdAt: u.createdAt || null,
+        })),
+      },
+    });
+  } catch (err) {
+    console.error("Admin analytics error:", err);
+    res.status(500).json({ success: false, message: "Failed to load admin analytics" });
+  }
+});
+
+// 2. GET ALL USERS (With search & role filtering)
+app.get("/api/admin/users", async (req, res) => {
+  try {
+    const { search, role } = req.query;
+    const query = {};
+
+    if (role && role !== "all") {
+      query.role = role.toLowerCase();
+    }
+    if (search) {
+      query.$or = [
+        { name: { $regex: search, $options: "i" } },
+        { email: { $regex: search, $options: "i" } },
+      ];
+    }
+
+    const users = await userCollection
+      .find(query)
+      .project({ password: 0 })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.json({
+      success: true,
+      count: users.length,
+      data: users.map((u) => ({
+        id: String(u._id),
+        _id: String(u._id),
+        name: u.name || "User",
+        email: u.email,
+        role: u.role || "developer",
+        targetCareer: u.targetCareer || "N/A",
+        createdAt: u.createdAt || null,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Failed to load users" });
+  }
+});
+
+// 3. UPDATE USER ROLE (Promote / Demote)
+app.patch("/api/admin/users/:id/role", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { role } = req.body;
+
+    if (!ObjectId.isValid(id) || !["developer", "mentor", "admin"].includes(role)) {
+      return res.status(400).json({ success: false, message: "Invalid user ID or role." });
+    }
+
+    const result = await userCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { role, updatedAt: new Date() } }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ success: false, message: "User not found." });
+    }
+
+    res.json({ success: true, message: `User role updated to ${role}.` });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Failed to update user role." });
+  }
+});
+
+// 4. DELETE USER
+app.delete("/api/admin/users/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid user ID." });
+    }
+
+    const result = await userCollection.deleteOne({ _id: new ObjectId(id) });
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ success: false, message: "User not found." });
+    }
+
+    res.json({ success: true, message: "User account deleted." });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Failed to delete user." });
+  }
+});
+
+// 5. GET ALL SKILLS (Across all careers)
+app.get("/api/admin/skills", async (req, res) => {
+  try {
+    const skills = await skillsCollection.find({}).sort({ courseSlug: 1, name: 1 }).toArray();
+    res.json({ success: true, data: skills });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Failed to fetch skills." });
+  }
+});
+
+// 6. CREATE SKILL
+app.post("/api/admin/skills", async (req, res) => {
+  try {
+    const { name, courseSlug, category, targetLevel, priority } = req.body;
+    if (!name || !courseSlug) {
+      return res.status(400).json({ success: false, message: "Name and courseSlug are required." });
+    }
+
+    const newSkill = {
+      name: String(name).trim(),
+      courseSlug: String(courseSlug).toLowerCase().trim(),
+      category: category || "General",
+      targetLevel: Number(targetLevel) || 3,
+      priority: Number(priority) || 1,
+      createdAt: new Date(),
+    };
+
+    const result = await skillsCollection.insertOne(newSkill);
+    res.status(201).json({ success: true, data: { ...newSkill, _id: result.insertedId } });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Failed to create skill." });
+  }
+});
+
+// 7. DELETE SKILL
+app.delete("/api/admin/skills/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) return res.status(400).json({ success: false, message: "Invalid ID." });
+    await skillsCollection.deleteOne({ _id: new ObjectId(id) });
+    res.json({ success: true, message: "Skill removed." });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Failed to remove skill." });
+  }
+});
+
+
+
+// ==========================================
+// USER PROFILE MANAGEMENT
+// ==========================================
+
+// 1. GET USER PROFILE
+app.get("/api/user/profile/:email", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.params.email);
+    if (!email) {
+      return res.status(400).json({ success: false, message: "Valid email is required." });
+    }
+
+    const user = await userCollection.findOne(
+      { email },
+      { projection: { password: 0 } }
+    );
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found." });
+    }
+
+    res.json({
+      success: true,
+      user: {
+        _id: user._id,
+        name: user.name || "",
+        email: user.email,
+        role: user.role || "developer",
+        image: user.image || "",
+        targetCareer: user.targetCareer || (user.role === "developer" ? "frontend" : ""),
+        bio: user.bio || "",
+        title: user.title || "",
+        expertise: user.expertise || "",
+        menteeCapacity: user.menteeCapacity || (user.role === "mentor" ? 15 : undefined),
+        activeMenteeCount: user.activeMenteeCount || 0,
+        githubUrl: user.githubUrl || "",
+        linkedinUrl: user.linkedinUrl || "",
+        portfolioUrl: user.portfolioUrl || "",
+        createdAt: user.createdAt,
+        updatedAt: user.updatedAt,
+      },
+    });
+  } catch (err) {
+    console.error("Error fetching user profile:", err);
+    res.status(500).json({ success: false, message: "Failed to fetch user profile." });
+  }
+});
+
+// 2. UPDATE USER PROFILE (EMAIL IS STRICTLY IMMUTABLE)
+const handleProfileUpdate = async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body.email || req.query.email);
+    if (!email) {
+      return res.status(400).json({ success: false, message: "Email is required to identify user." });
+    }
+
+    const existingUser = await userCollection.findOne({ email });
+    if (!existingUser) {
+      return res.status(404).json({ success: false, message: "User not found." });
+    }
+
+    // Whitelist allowed fields. EMAIL IS STRICTLY IMMUTABLE AND NEVER MODIFIED.
+    const updateFields = {
+      updatedAt: new Date(),
+    };
+
+    if (typeof req.body.name === "string") {
+      const trimmedName = req.body.name.trim();
+      if (!trimmedName) {
+        return res.status(400).json({ success: false, message: "Name cannot be empty." });
+      }
+      updateFields.name = trimmedName;
+    }
+
+    if (req.body.image !== undefined) {
+      updateFields.image = req.body.image ? String(req.body.image) : null;
+    }
+
+    if (typeof req.body.bio === "string") {
+      updateFields.bio = req.body.bio.trim().slice(0, 1000);
+    }
+
+    if (typeof req.body.title === "string") {
+      updateFields.title = req.body.title.trim().slice(0, 120);
+    }
+
+    if (typeof req.body.expertise === "string") {
+      updateFields.expertise = req.body.expertise.trim().slice(0, 300);
+    }
+
+    if (typeof req.body.targetCareer === "string") {
+      const allowedCareers = ["frontend", "backend", "fullstack", "software"];
+      const career = req.body.targetCareer.trim().toLowerCase();
+      if (allowedCareers.includes(career)) {
+        updateFields.targetCareer = career;
+      }
+    }
+
+    if (req.body.menteeCapacity !== undefined) {
+      const cap = Number(req.body.menteeCapacity);
+      if ([5, 10, 15, 20, 25, 30].includes(cap) || (cap >= 1 && cap <= 50)) {
+        updateFields.menteeCapacity = cap;
+      }
+    }
+
+    if (typeof req.body.githubUrl === "string") {
+      updateFields.githubUrl = req.body.githubUrl.trim().slice(0, 300);
+    }
+
+    if (typeof req.body.linkedinUrl === "string") {
+      updateFields.linkedinUrl = req.body.linkedinUrl.trim().slice(0, 300);
+    }
+
+    if (typeof req.body.portfolioUrl === "string") {
+      updateFields.portfolioUrl = req.body.portfolioUrl.trim().slice(0, 300);
+    }
+
+    await userCollection.updateOne(
+      { email },
+      { $set: updateFields }
+    );
+
+    const updatedUser = await userCollection.findOne(
+      { email },
+      { projection: { password: 0 } }
+    );
+
+    res.json({
+      success: true,
+      message: "Profile updated successfully.",
+      user: {
+        _id: updatedUser._id,
+        name: updatedUser.name,
+        email: updatedUser.email,
+        role: updatedUser.role,
+        image: updatedUser.image,
+        targetCareer: updatedUser.targetCareer,
+        bio: updatedUser.bio,
+        title: updatedUser.title,
+        expertise: updatedUser.expertise,
+        menteeCapacity: updatedUser.menteeCapacity,
+        activeMenteeCount: updatedUser.activeMenteeCount || 0,
+        githubUrl: updatedUser.githubUrl,
+        linkedinUrl: updatedUser.linkedinUrl,
+        portfolioUrl: updatedUser.portfolioUrl,
+        updatedAt: updatedUser.updatedAt,
+      },
+    });
+  } catch (err) {
+    console.error("Error updating user profile:", err);
+    res.status(500).json({ success: false, message: "Failed to update profile." });
+  }
+};
+
+app.put("/api/user/profile", handleProfileUpdate);
+app.patch("/api/user/profile", handleProfileUpdate);
+app.put("/api/users/profile", handleProfileUpdate);
+app.patch("/api/users/profile", handleProfileUpdate);
 
 // Call this only when application terminates
 export async function disconnectFromMongoDB() {
