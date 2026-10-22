@@ -6,6 +6,7 @@ import express from "express";
 import cors from "cors";
 import { MongoClient, ServerApiVersion } from "mongodb";
 import { ObjectId } from "mongodb";
+import { createRemoteJWKSet, jwtVerify } from "jose-cjs";
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -104,6 +105,68 @@ export async function connectToMongoDB() {
   }
 }
 
+// ==========================================
+// BETTER AUTH JWT VERIFICATION
+// ==========================================
+
+const NEXT_PUBLIC_BETTER_AUTH_URL = process.env.NEXT_PUBLIC_BETTER_AUTH_URL?.replace(/\/+$/, "");
+
+if (!NEXT_PUBLIC_BETTER_AUTH_URL) {
+  throw new Error("NEXT_PUBLIC_BETTER_AUTH_URL is missing in your .env file");
+}
+
+const JWKS = createRemoteJWKSet(
+  new URL(`${NEXT_PUBLIC_BETTER_AUTH_URL}/api/auth/jwks`),
+);
+
+
+
+const verifyToken = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader?.startsWith("Bearer ")) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication token is required",
+      });
+    }
+
+    const token = authHeader.slice(7).trim();
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication token is missing",
+      });
+    }
+
+    const { payload } = await jwtVerify(token, JWKS);
+
+    if (!payload.sub) {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid token: user ID is missing",
+      });
+    }
+
+    req.user = payload;
+
+    next();
+  } catch (error) {
+  console.error("JWT verification failed:", {
+    name: error.name,
+    code: error.code,
+    message: error.message,
+  });
+
+  return res.status(401).json({
+    success: false,
+    message: "Invalid or expired token",
+  });
+}
+};
+
 /* ========================================================
    COURSES CRUD APIS
 ======================================================== */
@@ -148,7 +211,7 @@ app.get("/api/courses/:identifier", async (req, res) => {
   }
 });
 // 3. CREATE NEW COURSE
-app.post("/api/courses", async (req, res) => {
+app.post("/api/courses",verifyToken, async (req, res) => {
   try {
     const {
       title,
@@ -186,7 +249,7 @@ app.post("/api/courses", async (req, res) => {
   }
 });
 // 4. UPDATE COURSE BY ID
-app.put("/api/courses/:id", async (req, res) => {
+app.put("/api/courses/:id",verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     const {
@@ -228,7 +291,7 @@ app.put("/api/courses/:id", async (req, res) => {
   }
 });
 // 5. DELETE COURSE BY ID
-app.delete("/api/courses/:id", async (req, res) => {
+app.delete("/api/courses/:id",verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     const result = await coursesCollection.deleteOne({ _id: new ObjectId(id) });
@@ -2912,7 +2975,7 @@ app.delete("/api/mentor/modules/:id", async (req, res) => {
 ======================================================== */
 
 // 1. ADMIN PLATFORM ANALYTICS
-app.get("/api/admin/analytics", async (req, res) => {
+app.get("/api/admin/analytics",verifyToken, async (req, res) => {
   try {
     const [
       totalUsers,
@@ -2969,7 +3032,7 @@ app.get("/api/admin/analytics", async (req, res) => {
 });
 
 // 2. GET ALL USERS (With search & role filtering)
-app.get("/api/admin/users", async (req, res) => {
+app.get("/api/admin/users", verifyToken, async (req, res) => {
   try {
     const { search, role } = req.query;
     const query = {};
@@ -3009,7 +3072,7 @@ app.get("/api/admin/users", async (req, res) => {
 });
 
 // 3. UPDATE USER ROLE (Promote / Demote)
-app.patch("/api/admin/users/:id/role", async (req, res) => {
+app.patch("/api/admin/users/:id/role", verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     const { role } = req.body;
@@ -3034,7 +3097,7 @@ app.patch("/api/admin/users/:id/role", async (req, res) => {
 });
 
 // 4. DELETE USER
-app.delete("/api/admin/users/:id", async (req, res) => {
+app.delete("/api/admin/users/:id", verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     if (!ObjectId.isValid(id)) {
@@ -3053,7 +3116,7 @@ app.delete("/api/admin/users/:id", async (req, res) => {
 });
 
 // 5. GET ALL SKILLS (Across all careers)
-app.get("/api/admin/skills", async (req, res) => {
+app.get("/api/admin/skills",verifyToken, async (req, res) => {
   try {
     const skills = await skillsCollection.find({}).sort({ courseSlug: 1, name: 1 }).toArray();
     res.json({ success: true, data: skills });
@@ -3063,7 +3126,7 @@ app.get("/api/admin/skills", async (req, res) => {
 });
 
 // 6. CREATE SKILL
-app.post("/api/admin/skills", async (req, res) => {
+app.post("/api/admin/skills",verifyToken, async (req, res) => {
   try {
     const { name, courseSlug, category, targetLevel, priority } = req.body;
     if (!name || !courseSlug) {
@@ -3087,7 +3150,7 @@ app.post("/api/admin/skills", async (req, res) => {
 });
 
 // 7. DELETE SKILL
-app.delete("/api/admin/skills/:id", async (req, res) => {
+app.delete("/api/admin/skills/:id",verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     if (!ObjectId.isValid(id)) return res.status(400).json({ success: false, message: "Invalid ID." });
