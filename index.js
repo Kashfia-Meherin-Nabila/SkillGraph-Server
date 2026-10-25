@@ -109,7 +109,8 @@ export async function connectToMongoDB() {
 // BETTER AUTH JWT VERIFICATION
 // ==========================================
 
-const NEXT_PUBLIC_BETTER_AUTH_URL = process.env.NEXT_PUBLIC_BETTER_AUTH_URL?.replace(/\/+$/, "");
+const NEXT_PUBLIC_BETTER_AUTH_URL =
+  process.env.NEXT_PUBLIC_BETTER_AUTH_URL?.replace(/\/+$/, "");
 
 if (!NEXT_PUBLIC_BETTER_AUTH_URL) {
   throw new Error("NEXT_PUBLIC_BETTER_AUTH_URL is missing in your .env file");
@@ -118,8 +119,6 @@ if (!NEXT_PUBLIC_BETTER_AUTH_URL) {
 const JWKS = createRemoteJWKSet(
   new URL(`${NEXT_PUBLIC_BETTER_AUTH_URL}/api/auth/jwks`),
 );
-
-
 
 const verifyToken = async (req, res, next) => {
   try {
@@ -154,18 +153,79 @@ const verifyToken = async (req, res, next) => {
 
     next();
   } catch (error) {
-  console.error("JWT verification failed:", {
-    name: error.name,
-    code: error.code,
-    message: error.message,
-  });
+    console.error("JWT verification failed:", {
+      name: error.name,
+      code: error.code,
+      message: error.message,
+    });
 
-  return res.status(401).json({
-    success: false,
-    message: "Invalid or expired token",
-  });
-}
+    return res.status(401).json({
+      success: false,
+      message: "Invalid or expired token",
+    });
+  }
 };
+
+// ==========================================
+// AUTHENTICATED USER AND MENTOR MIDDLEWARE
+// ==========================================
+
+function normalizeEmail(email) {
+  return String(email || "")
+    .trim()
+    .toLowerCase();
+}
+
+async function requireMentor(req, res, next) {
+  try {
+    const tokenEmail = normalizeEmail(req.user?.email);
+
+    if (!tokenEmail) {
+      return res.status(401).json({
+        success: false,
+        message: "Your token does not contain a user email.",
+      });
+    }
+
+    // Look up the real user in MongoDB.
+    // Never trust a role sent by the frontend.
+    const dbUser = await userCollection.findOne({
+      email: tokenEmail,
+    });
+
+    if (!dbUser) {
+      return res.status(403).json({
+        success: false,
+        message: "User account not found.",
+      });
+    }
+
+    if (String(dbUser.role || "").toLowerCase() !== "mentor") {
+      return res.status(403).json({
+        success: false,
+        message: "Only mentors can access this resource.",
+      });
+    }
+
+    // Use the verified database record for authorization.
+    req.mentor = {
+      id: String(dbUser._id),
+      name: dbUser.name || "",
+      email: normalizeEmail(dbUser.email),
+      role: "mentor",
+      menteeCapacity: Number(dbUser.menteeCapacity || 15),
+    };
+
+    return next();
+  } catch (error) {
+    console.error("Mentor authorization failed:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to verify mentor permissions.",
+    });
+  }
+}
 
 /* ========================================================
    COURSES CRUD APIS
@@ -211,7 +271,7 @@ app.get("/api/courses/:identifier", async (req, res) => {
   }
 });
 // 3. CREATE NEW COURSE
-app.post("/api/courses",verifyToken, async (req, res) => {
+app.post("/api/courses", verifyToken, async (req, res) => {
   try {
     const {
       title,
@@ -249,7 +309,7 @@ app.post("/api/courses",verifyToken, async (req, res) => {
   }
 });
 // 4. UPDATE COURSE BY ID
-app.put("/api/courses/:id",verifyToken, async (req, res) => {
+app.put("/api/courses/:id", verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     const {
@@ -291,7 +351,7 @@ app.put("/api/courses/:id",verifyToken, async (req, res) => {
   }
 });
 // 5. DELETE COURSE BY ID
-app.delete("/api/courses/:id",verifyToken, async (req, res) => {
+app.delete("/api/courses/:id", verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     const result = await coursesCollection.deleteOne({ _id: new ObjectId(id) });
@@ -327,7 +387,6 @@ app.get("/api/courses/:slug/modules", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch modules" });
   }
 });
-
 
 // 7. GET USER PROGRESS (Starts at 0 completed tasks)
 app.get("/api/progress/:email/:courseSlug", async (req, res) => {
@@ -579,7 +638,7 @@ app.get("/api/roadmap", async (req, res) => {
       .sort({ priority: 1, name: 1 })
       .toArray();
 
-        // Fetch approved modules for this career
+    // Fetch approved modules for this career
     const modules = await modulesCollection
       .find({
         courseSlug,
@@ -1315,128 +1374,133 @@ app.get("/api/developer/mentorship", async (req, res) => {
    18. MENTOR DASHBOARD OVERVIEW API
 ======================================================== */
 
-app.get("/api/mentor/overview", async (req, res) => {
-  try {
-    const db = client.db(process.env.DB_NAME || "skillgraph");
+app.get(
+  "/api/mentor/overview",
+  verifyToken,
+  requireMentor,
+  async (req, res) => {
+    try {
+      const db = client.db(process.env.DB_NAME || "skillgraph");
 
-    // Use the same collection initialized in connectToMongoDB().
-    const usersCol = userCollection || db.collection("user");
+      // Use the same collection initialized in connectToMongoDB().
+      const usersCol = userCollection || db.collection("user");
 
-    // These collections are resolved directly, avoiding
-    // undeclared JavaScript variables.
-    const reviewsCol = db.collection("codeReviews");
-    const sessionsCol = db.collection("advisorySessions");
+      // These collections are resolved directly, avoiding
+      // undeclared JavaScript variables.
+      const reviewsCol = db.collection("codeReviews");
+      const sessionsCol = db.collection("advisorySessions");
 
-    const developerQuery = {
-      $or: [
-        { role: { $regex: /^developer$/i } },
-        { type: { $regex: /^developer$/i } },
-        { accountType: { $regex: /^developer$/i } },
-      ],
-    };
+      const developerQuery = {
+        $or: [
+          { role: { $regex: /^developer$/i } },
+          { type: { $regex: /^developer$/i } },
+          { accountType: { $regex: /^developer$/i } },
+        ],
+      };
 
-    const [
-      activeMenteesCount,
-      mentees,
-      pendingReviewsCount,
-      pendingReviews,
-      upcomingCallsCount,
-      upcomingSessions,
-    ] = await Promise.all([
-      usersCol.countDocuments(developerQuery),
+      const [
+        activeMenteesCount,
+        mentees,
+        pendingReviewsCount,
+        pendingReviews,
+        upcomingCallsCount,
+        upcomingSessions,
+      ] = await Promise.all([
+        usersCol.countDocuments(developerQuery),
 
-      usersCol
-        .find(developerQuery)
-        .project({
-          name: 1,
-          email: 1,
-          targetCareer: 1,
-          createdAt: 1,
-        })
-        .sort({ createdAt: -1 })
-        .limit(10)
-        .toArray(),
+        usersCol
+          .find(developerQuery)
+          .project({
+            name: 1,
+            email: 1,
+            targetCareer: 1,
+            createdAt: 1,
+          })
+          .sort({ createdAt: -1 })
+          .limit(10)
+          .toArray(),
 
-      reviewsCol.countDocuments({
-        status: {
-          $in: ["Pending", "Submitted", "In Review"],
-        },
-      }),
-
-      reviewsCol
-        .find({
+        reviewsCol.countDocuments({
           status: {
             $in: ["Pending", "Submitted", "In Review"],
           },
-        })
-        .sort({ createdAt: -1 })
-        .limit(5)
-        .toArray(),
+        }),
 
-      sessionsCol.countDocuments({
-        status: {
-          $nin: ["Cancelled", "Completed"],
-        },
-      }),
+        reviewsCol
+          .find({
+            status: {
+              $in: ["Pending", "Submitted", "In Review"],
+            },
+          })
+          .sort({ createdAt: -1 })
+          .limit(5)
+          .toArray(),
 
-      sessionsCol
-        .find({
+        sessionsCol.countDocuments({
           status: {
             $nin: ["Cancelled", "Completed"],
           },
-        })
-        .sort({ date: 1 })
-        .limit(5)
-        .toArray(),
-    ]);
+        }),
 
-    res.json({
-      success: true,
-      data: {
-        activeMenteesCount,
+        sessionsCol
+          .find({
+            status: {
+              $nin: ["Cancelled", "Completed"],
+            },
+          })
+          .sort({ date: 1 })
+          .limit(5)
+          .toArray(),
+      ]);
 
-        pendingReviewsCount,
+      res.json({
+        success: true,
+        data: {
+          activeMenteesCount,
 
-        upcomingCallsCount,
+          pendingReviewsCount,
 
-        mentees: mentees.map((m) => ({
-          id: String(m._id),
-          name: m.name || m.email?.split("@")[0] || "Developer",
-          career: m.targetCareer || "Not specified",
-          readiness: null,
-          status: "Active",
-        })),
+          upcomingCallsCount,
 
-        pendingReviews: pendingReviews.map((r) => ({
-          id: String(r._id),
-          title: r.title || "Code Review",
-          menteeName: r.menteeName || r.email?.split("@")[0] || "Developer",
-          milestone: r.milestone || "General Milestone",
-          createdAt: r.createdAt || null,
-        })),
+          mentees: mentees.map((m) => ({
+            id: String(m._id),
+            name: m.name || m.email?.split("@")[0] || "Developer",
+            career: m.targetCareer || "Not specified",
+            readiness: null,
+            status: "Active",
+          })),
 
-        upcomingSessions: upcomingSessions.map((s) => ({
-          id: String(s._id),
-          title: s.title || "1-on-1 Mentorship Call",
-          menteeName: s.menteeName || "Developer",
-          date: s.date || null,
-          time: s.time || "As scheduled",
-          meetingUrl: s.meetingUrl || "",
-        })),
-      },
-    });
-  } catch (err) {
-    console.error("Failed to load mentor overview:", err);
+          pendingReviews: pendingReviews.map((r) => ({
+            id: String(r._id),
+            title: r.title || "Code Review",
+            menteeName: r.menteeName || r.email?.split("@")[0] || "Developer",
+            milestone: r.milestone || "General Milestone",
+            createdAt: r.createdAt || null,
+          })),
 
-    res.status(500).json({
-      success: false,
-      message: "Failed to load mentor overview",
-      ...(process.env.NODE_ENV === "development" && {
-        debug: err.message,
-      }),
-    });
-  }
-});
+          upcomingSessions: upcomingSessions.map((s) => ({
+            id: String(s._id),
+            title: s.title || "1-on-1 Mentorship Call",
+            menteeName: s.menteeName || "Developer",
+            date: s.date || null,
+            time: s.time || "As scheduled",
+            meetingUrl: s.meetingUrl || "",
+          })),
+        },
+      });
+    } catch (err) {
+      console.error("Failed to load mentor overview:", err);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to load mentor overview",
+        ...(process.env.NODE_ENV === "development" && {
+          debug: err.message,
+        }),
+      });
+    }
+  },
+);
 
 /* ========================================================
   19. MENTORS MENTEES DIRECTORY API
@@ -1761,11 +1825,6 @@ app.put("/api/mentor/reviews", async (req, res) => {
    MENTOR SESSIONS API
 ======================================================== */
 
-const normalizeEmail = (value) =>
-  String(value || "")
-    .trim()
-    .toLowerCase();
-
 const allowedSessionStatuses = [
   "pending",
   "confirmed",
@@ -1798,7 +1857,6 @@ async function getMentorByEmail(email) {
 //     ...extra,
 //   });
 
-
 const mentorCapacityOptions = [15, 20];
 
 // GET: public mentor marketplace
@@ -1826,7 +1884,7 @@ app.get("/api/mentorship/mentors", async (req, res) => {
         const email = normalizeEmail(mentor.email);
 
         const capacity = mentorCapacityOptions.includes(
-          Number(mentor.menteeCapacity)
+          Number(mentor.menteeCapacity),
         )
           ? Number(mentor.menteeCapacity)
           : 15;
@@ -1846,7 +1904,7 @@ app.get("/api/mentorship/mentors", async (req, res) => {
 
         const approvedMentees = approvedRequests.map((request) => {
           const menteeEmail = normalizeEmail(
-            request.menteeEmail || request.studentEmail
+            request.menteeEmail || request.studentEmail,
           );
 
           return {
@@ -1864,9 +1922,7 @@ app.get("/api/mentorship/mentors", async (req, res) => {
           email,
           image: mentor.image || mentor.avatar || "",
           expertise:
-            mentor.expertise ||
-            mentor.targetCareer ||
-            "Software Development",
+            mentor.expertise || mentor.targetCareer || "Software Development",
           bio: mentor.bio || "",
           title: mentor.title || "Software Development Mentor",
           capacity,
@@ -1875,7 +1931,7 @@ app.get("/api/mentorship/mentors", async (req, res) => {
           isAvailable: activeMentees < capacity,
           approvedMentees,
         };
-      })
+      }),
     );
 
     return res.json({
@@ -1885,14 +1941,9 @@ app.get("/api/mentorship/mentors", async (req, res) => {
   } catch (error) {
     console.error("Load mentor marketplace:", error);
 
-    return mentorshipResponse(
-      res,
-      500,
-      "Failed to load mentor marketplace."
-    );
+    return mentorshipResponse(res, 500, "Failed to load mentor marketplace.");
   }
 });
-
 
 // GET: mentorship requests for a developer or mentor
 app.get("/api/mentorship/requests", async (req, res) => {
@@ -2494,53 +2545,53 @@ app.put("/api/mentor/sessions/availability", async (req, res) => {
 });
 
 //24. GET mentor's sessions
-app.get("/api/mentor/sessions", async (req, res) => {
+
+app.get("/api/mentor/sessions", verifyToken, async (req, res) => {
   try {
-    const mentorEmail = normalizeEmail(req.query.mentorEmail);
-    const status = String(req.query.status || "").trim();
+    // Safely read from decoded JWT token, or fallback to query param
+    const email = normalizeEmail(req.user?.email || req.query.mentorEmail);
 
-    if (!mentorEmail) {
+    if (!email) {
       return res.status(400).json({
-        message: "Mentor email is required.",
+        success: false,
+        message: "User email could not be determined from token or query.",
       });
     }
 
-    const mentor = await getMentorByEmail(mentorEmail);
-
-    if (!mentor) {
-      return res.status(403).json({
-        message: "Mentor account not found.",
-      });
-    }
-
-    const query = { mentorEmail };
-
-    if (status && allowedSessionStatuses.includes(status)) {
-      query.status = status;
-    }
-
+    // Mentors see their hosted sessions; Developers see sessions hosted for them
     const sessions = await mentorSessionsCollection
-      .find(query)
-      .sort({ startAt: 1 })
-      .limit(200)
+      .find({
+        $or: [
+          { mentorEmail: email },
+          { menteeEmail: email },
+          { forAllMentees: true },
+        ],
+      })
+      .sort({ startAt: -1 })
       .toArray();
 
-    res.json({ sessions });
-  } catch (error) {
-    console.error("Get mentor sessions:", error);
-    res.status(500).json({
+    // Provide both `sessions` and `data` so any client format works seamlessly
+    return res.json({
+      success: true,
+      sessions,
+      data: sessions,
+    });
+  } catch (err) {
+    console.error("Error loading mentor sessions:", err);
+    return res.status(500).json({
+      success: false,
       message: "Failed to load sessions.",
     });
   }
 });
-
 
 // 25. CREATE A LIVE CONCEPTUAL / 1-ON-1 SESSION
 app.post("/api/mentor/sessions", async (req, res) => {
   try {
     const mentorEmail = normalizeEmail(req.body.mentorEmail);
     let menteeEmail = normalizeEmail(req.body.menteeEmail);
-    const { title, description, startAt, endAt, meetingLink, forAllMentees } = req.body;
+    const { title, description, startAt, endAt, meetingLink, forAllMentees } =
+      req.body;
 
     if (
       !mentorEmail ||
@@ -2550,14 +2601,16 @@ app.post("/api/mentor/sessions", async (req, res) => {
       !isValidDate(endAt)
     ) {
       return res.status(400).json({
-        message: "Provide session title, mentee/audience, start time, and end time.",
+        message:
+          "Provide session title, mentee/audience, start time, and end time.",
       });
     }
 
     // Prevent mentor from scheduling a session with themselves
     if (menteeEmail === mentorEmail) {
       return res.status(400).json({
-        message: "You cannot schedule a session with yourself. Select an active mentee or choose 'All Mentees'.",
+        message:
+          "You cannot schedule a session with yourself. Select an active mentee or choose 'All Mentees'.",
       });
     }
 
@@ -2614,10 +2667,14 @@ app.post("/api/mentor/sessions", async (req, res) => {
       menteeName,
       forAllMentees: isBroadcast,
       title: String(title).trim().slice(0, 150),
-      description: String(description || "").trim().slice(0, 2000),
+      description: String(description || "")
+        .trim()
+        .slice(0, 2000),
       startAt: start,
       endAt: end,
-      meetingLink: String(meetingLink || "").trim().slice(0, 1000),
+      meetingLink: String(meetingLink || "")
+        .trim()
+        .slice(0, 1000),
       status: "confirmed", // Created by mentor, ready to join
       notes: "",
       actionItems: [],
@@ -2772,7 +2829,7 @@ app.get("/api/developer/sessions", async (req, res) => {
     // Check if this developer has an assigned mentor
     const developer = await users.findOne({ email: menteeEmail });
     const mentorEmail = normalizeEmail(
-      developer?.assignedMentorEmail || developer?.mentorEmail || ""
+      developer?.assignedMentorEmail || developer?.mentorEmail || "",
     );
 
     // Matches:
@@ -2811,7 +2868,8 @@ app.get("/api/developer/sessions", async (req, res) => {
 // CREATE A NEW MODULE (By Mentor)
 app.post("/api/mentor/modules", async (req, res) => {
   try {
-    const { mentorEmail, courseSlug, title, moduleId, tasks, status } = req.body;
+    const { mentorEmail, courseSlug, title, moduleId, tasks, status } =
+      req.body;
 
     if (!mentorEmail || !courseSlug || !title) {
       return res.status(400).json({
@@ -2830,7 +2888,8 @@ app.post("/api/mentor/modules", async (req, res) => {
         .sort({ moduleId: -1 })
         .limit(1)
         .toArray();
-      finalModuleId = highestModule.length > 0 ? (highestModule[0].moduleId || 0) + 1 : 1;
+      finalModuleId =
+        highestModule.length > 0 ? (highestModule[0].moduleId || 0) + 1 : 1;
     }
 
     // Format tasks array
@@ -2875,8 +2934,12 @@ app.post("/api/mentor/modules", async (req, res) => {
 // GET ALL MODULES FOR MENTOR (With approval status filter)
 app.get("/api/mentor/modules", async (req, res) => {
   try {
-    const courseSlug = req.query.courseSlug ? String(req.query.courseSlug).toLowerCase().trim() : null;
-    const mentorEmail = req.query.mentorEmail ? normalizeEmail(req.query.mentorEmail) : null;
+    const courseSlug = req.query.courseSlug
+      ? String(req.query.courseSlug).toLowerCase().trim()
+      : null;
+    const mentorEmail = req.query.mentorEmail
+      ? normalizeEmail(req.query.mentorEmail)
+      : null;
 
     const query = {};
     if (courseSlug) query.courseSlug = courseSlug;
@@ -2887,7 +2950,10 @@ app.get("/api/mentor/modules", async (req, res) => {
       ];
     }
 
-    const modules = await modulesCollection.find(query).sort({ courseSlug: 1, moduleId: 1 }).toArray();
+    const modules = await modulesCollection
+      .find(query)
+      .sort({ courseSlug: 1, moduleId: 1 })
+      .toArray();
 
     // Default system modules without a status tag are treated as "approved"
     const formatted = modules.map((m) => ({
@@ -2916,7 +2982,9 @@ app.patch("/api/mentor/modules/:id/status", async (req, res) => {
     const { status } = req.body;
 
     if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid module ID." });
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid module ID." });
     }
 
     if (!["approved", "pending", "rejected"].includes(status)) {
@@ -2929,13 +2997,15 @@ app.patch("/api/mentor/modules/:id/status", async (req, res) => {
     const result = await modulesCollection.findOneAndUpdate(
       { _id: new ObjectId(id) },
       { $set: { status, updatedAt: new Date() } },
-      { returnDocument: "after" }
+      { returnDocument: "after" },
     );
 
     const updated = result?.value !== undefined ? result.value : result;
 
     if (!updated) {
-      return res.status(404).json({ success: false, message: "Module not found." });
+      return res
+        .status(404)
+        .json({ success: false, message: "Module not found." });
     }
 
     return res.status(200).json({
@@ -2945,7 +3015,9 @@ app.patch("/api/mentor/modules/:id/status", async (req, res) => {
     });
   } catch (error) {
     console.error("Failed to update module status:", error);
-    return res.status(500).json({ success: false, message: "Failed to update module status." });
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to update module status." });
   }
 });
 
@@ -2954,28 +3026,35 @@ app.delete("/api/mentor/modules/:id", async (req, res) => {
   try {
     const { id } = req.params;
     if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid module ID." });
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid module ID." });
     }
 
     const result = await modulesCollection.deleteOne({ _id: new ObjectId(id) });
     if (result.deletedCount === 0) {
-      return res.status(404).json({ success: false, message: "Module not found." });
+      return res
+        .status(404)
+        .json({ success: false, message: "Module not found." });
     }
 
-    return res.status(200).json({ success: true, message: "Module deleted successfully." });
+    return res
+      .status(200)
+      .json({ success: true, message: "Module deleted successfully." });
   } catch (error) {
     console.error("Failed to delete module:", error);
-    return res.status(500).json({ success: false, message: "Failed to delete module." });
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to delete module." });
   }
 });
-
 
 /* ========================================================
    ADMIN MANAGEMENT APIS
 ======================================================== */
 
 // 1. ADMIN PLATFORM ANALYTICS
-app.get("/api/admin/analytics",verifyToken, async (req, res) => {
+app.get("/api/admin/analytics", verifyToken, async (req, res) => {
   try {
     const [
       totalUsers,
@@ -3027,7 +3106,9 @@ app.get("/api/admin/analytics",verifyToken, async (req, res) => {
     });
   } catch (err) {
     console.error("Admin analytics error:", err);
-    res.status(500).json({ success: false, message: "Failed to load admin analytics" });
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to load admin analytics" });
   }
 });
 
@@ -3077,22 +3158,31 @@ app.patch("/api/admin/users/:id/role", verifyToken, async (req, res) => {
     const { id } = req.params;
     const { role } = req.body;
 
-    if (!ObjectId.isValid(id) || !["developer", "mentor", "admin"].includes(role)) {
-      return res.status(400).json({ success: false, message: "Invalid user ID or role." });
+    if (
+      !ObjectId.isValid(id) ||
+      !["developer", "mentor", "admin"].includes(role)
+    ) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid user ID or role." });
     }
 
     const result = await userCollection.updateOne(
       { _id: new ObjectId(id) },
-      { $set: { role, updatedAt: new Date() } }
+      { $set: { role, updatedAt: new Date() } },
     );
 
     if (result.matchedCount === 0) {
-      return res.status(404).json({ success: false, message: "User not found." });
+      return res
+        .status(404)
+        .json({ success: false, message: "User not found." });
     }
 
     res.json({ success: true, message: `User role updated to ${role}.` });
   } catch (err) {
-    res.status(500).json({ success: false, message: "Failed to update user role." });
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to update user role." });
   }
 });
 
@@ -3101,12 +3191,16 @@ app.delete("/api/admin/users/:id", verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid user ID." });
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid user ID." });
     }
 
     const result = await userCollection.deleteOne({ _id: new ObjectId(id) });
     if (result.deletedCount === 0) {
-      return res.status(404).json({ success: false, message: "User not found." });
+      return res
+        .status(404)
+        .json({ success: false, message: "User not found." });
     }
 
     res.json({ success: true, message: "User account deleted." });
@@ -3116,21 +3210,28 @@ app.delete("/api/admin/users/:id", verifyToken, async (req, res) => {
 });
 
 // 5. GET ALL SKILLS (Across all careers)
-app.get("/api/admin/skills",verifyToken, async (req, res) => {
+app.get("/api/admin/skills", verifyToken, async (req, res) => {
   try {
-    const skills = await skillsCollection.find({}).sort({ courseSlug: 1, name: 1 }).toArray();
+    const skills = await skillsCollection
+      .find({})
+      .sort({ courseSlug: 1, name: 1 })
+      .toArray();
     res.json({ success: true, data: skills });
   } catch (err) {
-    res.status(500).json({ success: false, message: "Failed to fetch skills." });
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch skills." });
   }
 });
 
 // 6. CREATE SKILL
-app.post("/api/admin/skills",verifyToken, async (req, res) => {
+app.post("/api/admin/skills", verifyToken, async (req, res) => {
   try {
     const { name, courseSlug, category, targetLevel, priority } = req.body;
     if (!name || !courseSlug) {
-      return res.status(400).json({ success: false, message: "Name and courseSlug are required." });
+      return res
+        .status(400)
+        .json({ success: false, message: "Name and courseSlug are required." });
     }
 
     const newSkill = {
@@ -3143,25 +3244,30 @@ app.post("/api/admin/skills",verifyToken, async (req, res) => {
     };
 
     const result = await skillsCollection.insertOne(newSkill);
-    res.status(201).json({ success: true, data: { ...newSkill, _id: result.insertedId } });
+    res
+      .status(201)
+      .json({ success: true, data: { ...newSkill, _id: result.insertedId } });
   } catch (err) {
-    res.status(500).json({ success: false, message: "Failed to create skill." });
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to create skill." });
   }
 });
 
 // 7. DELETE SKILL
-app.delete("/api/admin/skills/:id",verifyToken, async (req, res) => {
+app.delete("/api/admin/skills/:id", verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
-    if (!ObjectId.isValid(id)) return res.status(400).json({ success: false, message: "Invalid ID." });
+    if (!ObjectId.isValid(id))
+      return res.status(400).json({ success: false, message: "Invalid ID." });
     await skillsCollection.deleteOne({ _id: new ObjectId(id) });
     res.json({ success: true, message: "Skill removed." });
   } catch (err) {
-    res.status(500).json({ success: false, message: "Failed to remove skill." });
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to remove skill." });
   }
 });
-
-
 
 // ==========================================
 // USER PROFILE MANAGEMENT
@@ -3172,16 +3278,20 @@ app.get("/api/user/profile/:email", async (req, res) => {
   try {
     const email = normalizeEmail(req.params.email);
     if (!email) {
-      return res.status(400).json({ success: false, message: "Valid email is required." });
+      return res
+        .status(400)
+        .json({ success: false, message: "Valid email is required." });
     }
 
     const user = await userCollection.findOne(
       { email },
-      { projection: { password: 0 } }
+      { projection: { password: 0 } },
     );
 
     if (!user) {
-      return res.status(404).json({ success: false, message: "User not found." });
+      return res
+        .status(404)
+        .json({ success: false, message: "User not found." });
     }
 
     res.json({
@@ -3192,11 +3302,13 @@ app.get("/api/user/profile/:email", async (req, res) => {
         email: user.email,
         role: user.role || "developer",
         image: user.image || "",
-        targetCareer: user.targetCareer || (user.role === "developer" ? "frontend" : ""),
+        targetCareer:
+          user.targetCareer || (user.role === "developer" ? "frontend" : ""),
         bio: user.bio || "",
         title: user.title || "",
         expertise: user.expertise || "",
-        menteeCapacity: user.menteeCapacity || (user.role === "mentor" ? 15 : undefined),
+        menteeCapacity:
+          user.menteeCapacity || (user.role === "mentor" ? 15 : undefined),
         activeMenteeCount: user.activeMenteeCount || 0,
         githubUrl: user.githubUrl || "",
         linkedinUrl: user.linkedinUrl || "",
@@ -3207,7 +3319,9 @@ app.get("/api/user/profile/:email", async (req, res) => {
     });
   } catch (err) {
     console.error("Error fetching user profile:", err);
-    res.status(500).json({ success: false, message: "Failed to fetch user profile." });
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch user profile." });
   }
 });
 
@@ -3216,12 +3330,19 @@ const handleProfileUpdate = async (req, res) => {
   try {
     const email = normalizeEmail(req.body.email || req.query.email);
     if (!email) {
-      return res.status(400).json({ success: false, message: "Email is required to identify user." });
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message: "Email is required to identify user.",
+        });
     }
 
     const existingUser = await userCollection.findOne({ email });
     if (!existingUser) {
-      return res.status(404).json({ success: false, message: "User not found." });
+      return res
+        .status(404)
+        .json({ success: false, message: "User not found." });
     }
 
     // Whitelist allowed fields. EMAIL IS STRICTLY IMMUTABLE AND NEVER MODIFIED.
@@ -3232,7 +3353,9 @@ const handleProfileUpdate = async (req, res) => {
     if (typeof req.body.name === "string") {
       const trimmedName = req.body.name.trim();
       if (!trimmedName) {
-        return res.status(400).json({ success: false, message: "Name cannot be empty." });
+        return res
+          .status(400)
+          .json({ success: false, message: "Name cannot be empty." });
       }
       updateFields.name = trimmedName;
     }
@@ -3280,14 +3403,11 @@ const handleProfileUpdate = async (req, res) => {
       updateFields.portfolioUrl = req.body.portfolioUrl.trim().slice(0, 300);
     }
 
-    await userCollection.updateOne(
-      { email },
-      { $set: updateFields }
-    );
+    await userCollection.updateOne({ email }, { $set: updateFields });
 
     const updatedUser = await userCollection.findOne(
       { email },
-      { projection: { password: 0 } }
+      { projection: { password: 0 } },
     );
 
     res.json({
@@ -3313,7 +3433,9 @@ const handleProfileUpdate = async (req, res) => {
     });
   } catch (err) {
     console.error("Error updating user profile:", err);
-    res.status(500).json({ success: false, message: "Failed to update profile." });
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to update profile." });
   }
 };
 
